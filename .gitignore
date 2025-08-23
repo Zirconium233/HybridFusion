@@ -1,0 +1,21 @@
+# ide
+.vscode/
+.idea/
+.cursor/
+
+# checkpoint
+checkpoints/
+*.pth
+
+# log
+*.log
+logs/
+
+# python
+*.pyc
+*.pyo
+*.pyd
+__pycache__/
+
+# data
+data/

@@ -1,0 +1,59 @@
+# config/train_rl.yml
+
+run_name: "fusion_diffusion_RL_v1"
+output_dir: "./checkpoints/stage2/"
+stage1_checkpoint_dir: "./checkpoints/stage1/your_pretrained_model/epoch_200/"
+
+# 模型相关配置 (应与Stage 1保持一致)
+model_config:
+  unet:
+    block_out_channels: [64, 128, 256, 256]
+    down_block_types: ["DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"]
+    up_block_types: ["UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"]
+    cross_attention_dim: 512
+    in_channels: 4
+    out_channels: 4
+    sample_size: 160
+
+  encoder:
+    in_channels: 4
+    out_channels: 512
+    base_channels: 64
+
+  vae:
+    sample_size: 128
+    in_channels: 3
+    out_channels: 3
+    down_block_types: ["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"]
+    up_block_types: ["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"]
+    block_out_channels: [64, 128, 256]
+    latent_channels: 4
+    scale_factor: 4
+
+# RL训练相关配置
+rl_training:
+  num_epochs: 100
+  policy_learning_rate: 1.0e-5
+  value_learning_rate: 1.0e-4
+  kl_weight: 0.02
+  reward_weight: 1.0
+  ppo_clip_range: 0.2
+  policy_update_steps: 10
+  value_update_steps: 10
+  use_kl: false
+  use_value_net: false
+
+# 数据集和采样配置
+data:
+  name: "MSRS"
+  train:
+    dir_A: './data/MSRS-main/MSRS-main/train/vi'
+    dir_B: './data/MSRS-main/MSRS-main/train/ir'
+  patch_size: 128
+  augment: true
+  train_batch_size: 4
+  num_inference_steps: 50
+
+# 保存和日志
+logging:
+  save_freq: 20
