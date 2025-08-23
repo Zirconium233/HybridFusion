@@ -1,7 +1,7 @@
 # config/pretrain_config.yml
 
 run_name: "fusion_diffusion_pretrain_v1"
-output_dir: "./checkpoints/stage1/"
+output_dir: "./checkpoints/pretrain/"
 
 # 模型相关配置（分层：unet / encoder / vae）
 model_config:
@@ -27,12 +27,18 @@ model_config:
     up_block_types: ["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"]
     block_out_channels: [64, 128, 256]
     latent_channels: 4
-    scale_factor: 4
+    # scale_factor: 4
+    scaling_factor: 0.057867
+    checkpoint_dir: "./checkpoints/vae/best.pth"
+
+
+diffusion:
+  num_inference_steps: 10
   
 # 训练相关配置
 training:
-  num_epochs: 200
-  train_batch_size: 8
+  num_epochs: 2000 # quick_test
+  train_batch_size: 16
   learning_rate: 1.0e-4
   optimizer:
     type: "AdamW"
@@ -42,11 +48,11 @@ training:
   scheduler:
     type: "CosineAnnealingLR"
     args:
-      T_max: 200
+      T_max: 2000
       eta_min: 1.0e-6
   loss_function: "l1"
-  test_freq: 10
-  save_freq: 20
+  test_freq: 200
+  save_freq: 200
 
 # 数据集配置
 datasets:
@@ -54,14 +60,14 @@ datasets:
     train:
       dir_A: './data/MSRS-main/MSRS-main/train/vi'
       dir_B: './data/MSRS-main/MSRS-main/train/ir'
+      dir_C: './data/MSRS-main/MSRS-main/train/label'
     test:
       dir_A: './data/MSRS-main/MSRS-main/test/vi'
       dir_B: './data/MSRS-main/MSRS-main/test/ir'
 
 train_dataset:
   name: "MSRS"
-  patch_size: 128
-  augment: true
 
 test_sets:
   - name: "MSRS"
+    test_batch_size: 4

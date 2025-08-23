@@ -316,6 +316,7 @@ if __name__ == "__main__":
         up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
         block_out_channels=(64, 128, 256),  # 与 down block 数量对应
         latent_channels=vae_latent_channels,
+        scaling_factor=0.057867
     )
 
     # 明确指定 4 倍下采样（无需再推断/测量）

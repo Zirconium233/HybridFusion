@@ -217,17 +217,19 @@ if __name__ == "__main__":
 
     default_train_A = './data/MSRS-main/MSRS-main/train/vi'
     default_train_B = './data/MSRS-main/MSRS-main/train/ir'
+    default_train_C = './data/MSRS-main/MSRS-main/train/label'
     default_test_A = './data/MSRS-main/MSRS-main/test/vi'
     default_test_B = './data/MSRS-main/MSRS-main/test/ir'
 
     if args.train:
-        dirA, dirB = default_train_A, default_train_B
+        dirA, dirB, dirC = default_train_A, default_train_B, default_train_C
     else:
         dirA, dirB = default_test_A, default_test_B
 
     ds = ImageFusionDataset(
         dir_A=dirA,
         dir_B=dirB,
+        dir_C=dirC,
         is_train=args.train,
         is_getpatch=False,
         patch_size=128,
@@ -240,7 +242,7 @@ if __name__ == "__main__":
     loader = DataLoader(ds, batch_size=4, shuffle=True, num_workers=2, drop_last=False)
     print(f"Dataset size: {len(ds)}, running one epoch test...")
     total = 0
-    for batch_idx, (A, B) in enumerate(loader):
+    for batch_idx, (A, B, C) in enumerate(loader):
         total += A.size(0)
-        print(f"Batch {batch_idx}: A {tuple(A.shape)}, B {tuple(B.shape)}")
+        print(f"Batch {batch_idx}: A {tuple(A.shape)}, B {tuple(B.shape)}, C {tuple(C.shape)}")
     print(f"Finished epoch, total samples: {total}")

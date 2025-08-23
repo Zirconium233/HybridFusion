@@ -140,7 +140,7 @@ def try_encode_latent(vae, imgs):
     enc = vae.encode(imgs)
     if hasattr(enc, 'latent_dist'):
         try:
-            lat = enc.latent_dist.sample()
+            lat = enc.latent_dist.sample() # This line works
         except Exception:
             lat = enc.latent_dist.mean
     elif isinstance(enc, dict):
@@ -162,7 +162,7 @@ def try_decode(vae, latents):
     out = vae.decode(latents)
     if isinstance(out, dict):
         if 'sample' in out:
-            return out['sample']
+            return out['sample'] # This line works
         for v in out.values():
             if isinstance(v, torch.Tensor):
                 return v

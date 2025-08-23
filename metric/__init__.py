@@ -1,5 +1,8 @@
 from .Metric import *
 
+# expose GPU batch implementations
+from .MetricGPU import *
+
 __all__ = [
     # CPU版本指标
     'EN_function',    # 熵(Entropy) - 评估图像信息丰富程度
@@ -15,6 +18,21 @@ __all__ = [
     'Qabf_function',  # 边缘信息保持质量(Edge Preservation Quality) - 评估边缘信息保持程度
     'Nabf_function',  # 非线性边缘保持质量(Nonlinear Edge Preservation Quality) - 评估非线性边缘保持程度
     'SSIM_function',  # 结构相似性(Structural Similarity) - 评估结构信息保持质量
-    'MS_SSIM_function', # 多尺度结构相似性(Multi-Scale Structural Similarity) - 多尺度评估结构信息
-    
+    # 'MS_SSIM_function', # 多尺度结构相似性(Multi-Scale Structural Similarity) - 多尺度评估结构信息
+
+    # GPU batch 版本（以 _batch 结尾）
+    'EN_function_batch',
+    'MI_function_batch',
+    'SF_function_batch',
+    'AG_function_batch',
+    'SD_function_batch',
+    'CC_function_batch',
+    'SCD_function_batch',
+    'VIF_function_batch',
+    'MSE_function_batch',
+    'PSNR_function_batch',
+    'Qabf_function_batch',
+    'Nabf_function_batch',
+    'SSIM_function_batch',
+    # 'MS_SSIM_function_batch', # 这个的GPU实现存在误差，先不使用
 ]
