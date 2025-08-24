@@ -1,5 +1,3 @@
-# train_rl.py
-
 import os
 import yaml
 import argparse
@@ -12,7 +10,7 @@ from tqdm.auto import tqdm
 from diffusers import UNet2DConditionModel, DDIMScheduler, AutoencoderKL
 
 from model.pipeline import ImageFusionPipeline, ConditioningEncoder, ddim_step_with_logprob
-# 尝试可选导入 ValueNetwork；若失败则降级到 batch-based advantages（GRPO 风格）
+# optional value network
 try:
     from value_network import ValueNetwork
     VALUE_NET_IMPORT_OK = True
@@ -22,103 +20,84 @@ except Exception:
 
 from dataset import ImageFusionDataset
 
+# ------------------ 新增：ModelWrapper，避免在使用 DeepSpeed/Accelerate 时将多个独立模型传入 prepare ------------------
+import torch.nn as nn
+class ModelWrapper(nn.Module):
+    """
+    Wrap UNet 和 ConditioningEncoder 为单个 module，避免向 accelerator.prepare 传入多个模型导致 DeepSpeed 报错。
+    行为与 pretrain.py 中的 Wrapper 保持一致：forward 返回 unet 的 predicted noise。
+    """
+    def __init__(self, unet: nn.Module, encoder: nn.Module):
+        super().__init__()
+        self.unet = unet
+        self.encoder = encoder
+
+    def forward(self, noisy_latent, timesteps, condition_img):
+        condition_embeds = self.encoder(condition_img)
+        out = self.unet(noisy_latent, timesteps, encoder_hidden_states=condition_embeds)
+        # diffusers UNet 返回的是 ModelOutput-like or tuple; 保证返回 .sample 以兼容已有代码
+        pred = out.sample if hasattr(out, "sample") else (out[0] if isinstance(out, (list, tuple)) else out)
+        return pred
+
 
 def find_vae_checkpoint(ckpt_dir="./checkpoints/vae/best"):
-    """查找VAE checkpoint文件"""
-    cand = [
-        os.path.join(ckpt_dir, "best.pth"),
-        os.path.join(ckpt_dir, "vae.pth"),
-        os.path.join(ckpt_dir, "best.ckpt"),
-        os.path.join(ckpt_dir, "checkpoint.pth"),
-        os.path.join(ckpt_dir, "model.pth"),
-        os.path.join(ckpt_dir, "latest.pth"),
-    ]
-    for p in cand:
-        if os.path.exists(p):
-            return p
-    return None
+    # 兼容传入文件路径或目录路径
+    ckpt_dir = os.path.expanduser(ckpt_dir)
+    if os.path.isfile(ckpt_dir):
+        return ckpt_dir
+    if os.path.isdir(ckpt_dir):
+        cand = [
+            os.path.join(ckpt_dir, "best.pth"),
+            os.path.join(ckpt_dir, "vae.pth"),
+            os.path.join(ckpt_dir, "best.ckpt"),
+            os.path.join(ckpt_dir, "checkpoint.pth"),
+            os.path.join(ckpt_dir, "model.pth"),
+            os.path.join(ckpt_dir, "latest.pth"),
+        ]
+        for p in cand:
+            if os.path.exists(p):
+                return p
+    # 兜底：直接返回给定路径（如果存在），否则 None
+    return ckpt_dir if os.path.exists(ckpt_dir) else None
 
 
-def main(config, test_run):
-    # --- 1. 初始化和配置加载 ---
+def main(config_path: str, test_run: bool = False):
+    with open(config_path, 'r') as f:
+        config = yaml.safe_load(f)
+
     project_dir = os.path.join(config['output_dir'], config['run_name'])
     os.makedirs(project_dir, exist_ok=True)
-    
+
     accelerator = Accelerator(
-        log_with="tensorboard", 
-        project_dir=project_dir
+        log_with="tensorboard",
+        project_dir=project_dir,
     )
-    
+
     if accelerator.is_main_process:
-        # 保存配置文件副本
-        config_copy_path = os.path.join(project_dir, "config.yml")
-        with open(config_copy_path, 'w') as f:
-            yaml.dump(config, f, indent=2)
-        print(f"Configuration saved to: {config_copy_path}")
-        print(f"Starting Run: {config['run_name']}")
-        print("Configuration:")
-        print(yaml.dump(config, indent=2))
+        config_copy = os.path.join(project_dir, "config.yml")
+        shutil.copy2(config_path, config_copy)
+        print(f"Saved config -> {config_copy}")
 
-    # --- 2. 模型、优化器和数据加载器设置 ---
-    
-    # 加载Stage 1预训练好的模型
-    stage1_dir = config['stage1_checkpoint_dir']
-    # 使用配置字典实例化模型
-    unet = UNet2DConditionModel(**config['model_config']['unet'])
-    encoder = ConditioningEncoder(**config['model_config']['encoder'])
-    
-    # 仅在真实训练时加载 Stage1 的权重（test_run 保持随机初始用于快速验证）
-    if not test_run:
-        if accelerator.is_main_process:
-            print(f"Loading Stage 1 models from {stage1_dir}")
-        try:
-            unet_sd = torch.load(os.path.join(stage1_dir, "unet.pth"), map_location="cpu")
-            encoder_sd = torch.load(os.path.join(stage1_dir, "encoder.pth"), map_location="cpu")
-            # 如果保存的是 dict 包装（state_dict），尝试提取
-            if isinstance(unet_sd, dict) and 'model_state_dict' in unet_sd:
-                unet_sd = unet_sd['model_state_dict']
-            if isinstance(encoder_sd, dict) and 'model_state_dict' in encoder_sd:
-                encoder_sd = encoder_sd['model_state_dict']
-            unet.load_state_dict(unet_sd)
-            encoder.load_state_dict(encoder_sd)
-            if accelerator.is_main_process:
-                print("Stage 1 models loaded successfully")
-        except Exception as e:
-            if accelerator.is_main_process:
-                print(f"Warning: Failed to load Stage 1 models: {e}")
-    
-    # 创建一个冻结的参考网络，用于计算KL散度 (DPOK的核心思想)
-    unet_ref = None
-    if config.get('rl_training', {}).get('use_kl', False):
-        unet_ref = UNet2DConditionModel(**config['model_config']['unet'])
-        unet_ref.load_state_dict(unet.state_dict())
-        unet_ref.requires_grad_(False)
-    
-    
-    # 是否使用 value network，由 config 控制且导入成功才开启
-    use_value_net = bool(config.get('rl_training', {}).get('use_value_net', False)) and VALUE_NET_IMPORT_OK
-    if bool(config.get('rl_training', {}).get('use_value_net', False)) and not VALUE_NET_IMPORT_OK:
-        if accelerator.is_main_process:
-            print("Warning: ValueNetwork import failed; falling back to batch advantages (GRPO-style).")
-    if use_value_net:
-        # 初始化价值网络（假定 latent 维度/条件维度由 config 提供或使用默认）
-        latent_dim = config.get('rl_training', {}).get('value_latent_dim', 4*32*32)
-        condition_dim = config['model_config']['unet']['cross_attention_dim']
-        value_net = ValueNetwork(latent_dim=latent_dim, condition_dim=condition_dim)
-    else:
-        value_net = None
+    # --- build models ---
+    unet_cfg = config['model_config']['unet']
+    enc_cfg = config['model_config']['encoder']
+    vae_cfg = config['model_config'].get('vae', None)
 
-    # 实例化VAE并创建Pipeline（使用config中的 vae 配置），并尝试加载外部训练好的 VAE
-    scheduler = DDIMScheduler(num_train_timesteps=1000, beta_schedule='squaredcos_cap_v2')
-    vae_cfg = config.get('model_config', {}).get('vae', None)
+    unet = UNet2DConditionModel(**unet_cfg)
+    encoder = ConditioningEncoder(**enc_cfg)
+
+    # 用 wrapper 将 unet 与 encoder 包装为单个模块，避免 accelerate.prepare 时传入多个模型
+    model_wrapper = ModelWrapper(unet, encoder)
+
+    # VAE: optional, try to load checkpoint if provided
+    vae = None
     if vae_cfg is not None:
-        vae = AutoencoderKL(**{k: v for k, v in vae_cfg.items() if k in ["sample_size", "in_channels", "out_channels", "down_block_types", "up_block_types", "block_out_channels", "latent_channels"]})
-        # 查找外部 vae checkpoint（默认路径可在 rl.yml 中配置）
-        vae_ckpt_dir = vae_cfg.get('checkpoint_dir', "./checkpoints/vae/best")
-        vae_ckpt = find_vae_checkpoint(vae_ckpt_dir)
-        if vae_ckpt is not None:
+        vae_init_kwargs = {k: v for k, v in vae_cfg.items() if k in ["sample_size", "in_channels", "out_channels", "down_block_types", "up_block_types", "block_out_channels", "latent_channels", "scaling_factor"]}
+        vae = AutoencoderKL(**vae_init_kwargs)
+        vae_ckpt = find_vae_checkpoint(vae_cfg.get('checkpoint_dir', "./checkpoints/vae/best"))
+        if vae_ckpt:
             if accelerator.is_main_process:
-                print(f"Loading VAE from {vae_ckpt}")
+                print(f"Loading VAE checkpoint from {vae_ckpt}")
             sd = torch.load(vae_ckpt, map_location="cpu")
             if isinstance(sd, dict) and 'model_state_dict' in sd:
                 sd = sd['model_state_dict']
@@ -126,237 +105,255 @@ def main(config, test_run):
                 vae.load_state_dict(sd)
             except Exception as e:
                 if accelerator.is_main_process:
-                    print(f"Partial load of VAE state_dict, error: {e}")
-                own_state = vae.state_dict()
-                filtered = {k: v for k, v in sd.items() if k in own_state and own_state[k].shape == v.shape}
-                own_state.update(filtered)
-                vae.load_state_dict(own_state)
+                    print(f"Partial VAE load: {e}")
+                own = vae.state_dict()
+                filtered = {k: v for k, v in sd.items() if k in own and own[k].shape == v.shape}
+                own.update(filtered)
+                vae.load_state_dict(own)
         else:
             if accelerator.is_main_process:
-                print("No VAE checkpoint found for RL; continuing with randomly initialized VAE (not recommended)")
+                print("Warning: no VAE checkpoint found; proceeding with randomly init VAE (not recommended).")
 
-        vae_scale = vae_cfg.get('scale_factor', None)
-    else:
-        vae = None
-        vae_scale = None
+    # scheduler
+    scheduler = DDIMScheduler(num_train_timesteps=1000, beta_schedule='squaredcos_cap_v2')
 
-    pipeline = ImageFusionPipeline(unet=unet, scheduler=scheduler, encoder=encoder, vae=vae, vae_scale_factor=vae_scale)
+    # pipeline: pass vae_scale_factor if provided in config (spatial downsample factor), otherwise let pipeline infer
+    vae_scale_factor = vae_cfg.get('vae_scale_factor') if vae_cfg is not None else None
+    # pipeline = ImageFusionPipeline(unet=unet, scheduler=scheduler, encoder=encoder, vae=vae, vae_scale_factor=vae_scale_factor)
+    # pipeline 后面 prepare 完成后定义
 
-    # 优化器
+    # optimizers
     policy_optimizer = torch.optim.AdamW(list(unet.parameters()) + list(encoder.parameters()), lr=config['rl_training']['policy_learning_rate'])
+
+    # optional value net
+    use_value_net = bool(config.get('rl_training', {}).get('use_value_net', False)) and VALUE_NET_IMPORT_OK
+    if bool(config.get('rl_training', {}).get('use_value_net', False)) and not VALUE_NET_IMPORT_OK and accelerator.is_main_process:
+        print("ValueNetwork import failed; falling back to batch-based advantages.")
+    value_net = None
     value_optimizer = None
     if use_value_net:
+        latent_dim = config['rl_training'].get('value_latent_dim', 4*32*32)
+        condition_dim = unet_cfg['cross_attention_dim']
+        value_net = ValueNetwork(latent_dim=latent_dim, condition_dim=condition_dim)
         value_optimizer = torch.optim.AdamW(value_net.parameters(), lr=config['rl_training']['value_learning_rate'])
 
-    # 数据加载器：加载 label (dir_C) 但暂时不使用 label 信号
-    if not test_run:
+    # dataloader or test dummy
+    if test_run:
+        bs = 4
+        # 为 accelerate.prepare / DeepSpeed 提供一个合法的 DataLoader（必须有 batch_size 属性）
+        # 使用单个小批次的 TensorDataset 作为最小封装，避免 prepare 报错
+        vis = torch.randn(bs, 3, 480, 640)
+        ir = torch.randn(bs, 1, 480, 640)
+        dataset = torch.utils.data.TensorDataset(vis, ir)
+        train_loader = DataLoader(dataset, batch_size=bs)
+    else:
         train_ds_config = config['data']
         train_dataset = ImageFusionDataset(
             dir_A=train_ds_config['train']['dir_A'],
             dir_B=train_ds_config['train']['dir_B'],
-            dir_C=train_ds_config['train'].get('dir_C', None),  # load labels if provided, not used currently
-            is_train=True, is_getpatch=True, patch_size=train_ds_config['patch_size'], augment=train_ds_config['augment']
+            dir_C=train_ds_config['train'].get('dir_C', None),
+            is_train=True,    # 与 pretrain 保持一致：使用全分辨率训练 / 不裁patch
+            is_getpatch=False, 
+            augment=train_ds_config['augment']
         )
-        train_loader = DataLoader(train_dataset, batch_size=train_ds_config['train_batch_size'], shuffle=True)
-    
-    # 准备所有组件（有选择地包含value_net / value_optimizer）
-    prepare_list = [unet, encoder, policy_optimizer]
+        train_loader = DataLoader(train_dataset, batch_size=train_ds_config['train_batch_size'], shuffle=True, num_workers=train_ds_config.get('num_workers', 4))
+
+    # Prepare with accelerator: DO NOT include VAE (keep consistent with pretrain)
+    # 传入 model_wrapper 而不是单独的 unet/encoder，避免 DeepSpeed 报错
+    prepare_list = [model_wrapper, policy_optimizer, train_loader]
     if use_value_net:
-        prepare_list.extend([value_net, value_optimizer])
-    if not test_run:
-        prepare_list.append(train_loader)
-    # 如果 VAE 存在，把它也放进 prepare（仅用于推理 decode / encode）
-    if vae is not None:
-        prepare_list.insert(0, vae)
+        prepare_list += [value_net, value_optimizer]
     prepared = accelerator.prepare(*prepare_list)
-    # unpack prepared items
+
+    # unpack
     idx = 0
-    if vae is not None:
-        vae = prepared[idx]; idx += 1
-    unet = prepared[idx]; idx += 1
-    encoder = prepared[idx]; idx += 1
+    model_wrapper = prepared[idx]; idx += 1
     policy_optimizer = prepared[idx]; idx += 1
     if use_value_net:
         value_net = prepared[idx]; idx += 1
         value_optimizer = prepared[idx]; idx += 1
-    if not test_run:
-        train_loader = prepared[idx]; idx += 1
+    # train_loader 也会被 prepare（test_run 时是 Dummy DataLoader）
+    train_loader = prepared[idx]; idx += 1
 
-    if unet_ref is not None:
-        unet_ref.to(accelerator.device)
-    if use_value_net and value_net is not None:
-        value_net.to(accelerator.device)
+    # move VAE to device manually if present
+    device = accelerator.device
+    model_dtype = next(unet.parameters()).dtype
+    if vae is not None:
+        vae = vae.to(device=device, dtype=model_dtype)
 
-    # 保证 scheduler 在外部也设置 timesteps（供 timesteps_batch 使用）
+    # --- CRITICAL FIX: ensure pipeline references the prepared/moved modules ---
+    # pipeline was created之前，self.unet/self.encoder 可能还指向旧实例。
+    # 这里把 pipeline 中的模块替换为 prepare 后、已在 device 上的实例。
+    # try:
+    #     # 使用 DiffusionPipeline.register_modules 更安全地注册（覆盖旧引用）
+    #     pipeline.register_modules(unet=unet, encoder=encoder, vae=vae, scheduler=scheduler)
+    # except Exception:
+    #     # 兜底：直接赋值
+    #     pipeline.unet = unet
+    #     pipeline.encoder = encoder
+    #     pipeline.vae = vae
+    #     pipeline.scheduler = scheduler
+    # 直接在这里定义pipeline
+    # 从 wrapper 中取出已 prepare 的子模块用于 pipeline（注意 model_wrapper 可能是 accelerate 包装后的对象）
+    # 使用属性访问，以确保 pipeline 使用同一套参数/设备
+    unet = model_wrapper.unet
+    encoder = model_wrapper.encoder
+    pipeline = ImageFusionPipeline(unet=unet, scheduler=scheduler, encoder=encoder, vae=vae, vae_scale_factor=vae_scale_factor)
+
+    # ensure scheduler timesteps set
     num_inf_steps = config['data']['num_inference_steps']
     scheduler.set_timesteps(num_inf_steps)
 
-    # --- 3. Reward函数 (Placeholder) ---
+    # simple reward placeholder
     def reward_fn(images, **kwargs):
-        """Placeholder for the reward function. Returns a random score."""
         return torch.randn(images.shape[0], device=accelerator.device)
 
-    # --- 4. 测试运行逻辑 ---
-    if test_run:
-        if accelerator.is_main_process:
-            print("\n--- Starting Test Run ---")
-        # 创建虚拟数据
-        bs = 2
-        ps = config['data']['patch_size']
-        vis_images = torch.randn(bs, 3, ps, ps, device=accelerator.device)
-        ir_images = torch.randn(bs, 1, ps, ps, device=accelerator.device)
-        # 将虚拟数据包装成一个批次
-        test_batch = (vis_images, ir_images)
-        # 只跑一个批次
-        train_loader = [test_batch]
-    
-    num_inf_steps = config['data']['num_inference_steps']
-
-    # --- 5. 训练循环 ---
+    # training loop (simplified DDPO-like)
     for epoch in range(config['rl_training']['num_epochs']):
         pbar = tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"RL Epoch {epoch+1}")
-        
         for batch in pbar:
-            # 支持 (vis, ir, label) 或 (vis, ir)
+            batch = tuple(t.to(device, dtype=model_dtype) for t in batch)
             if isinstance(batch, (list, tuple)) and len(batch) == 3:
-                vis_images, ir_images, _label_images = batch
+                vis_images, ir_images, _ = batch
             else:
                 vis_images, ir_images = batch
 
-            # --- 5.1 采样/收集轨迹 (Rollout) ---
+            vis_images = vis_images.to(accelerator.device)
+            ir_images = ir_images.to(accelerator.device)
+            # 原始条件图（供 ModelWrapper 内部调用 encoder）
+            condition_img = torch.cat([vis_images, ir_images], dim=1)
+            # 如果需要 condition_embeds（value_net 分支仍可使用），可以提前计算
+            condition_embeds = None
+            # rollout
             with torch.no_grad():
-                final_images, latents_history, old_log_probs = pipeline.forward_with_logprob(
+                decoded, latents_history, old_log_probs = pipeline.forward_with_logprob(
                     vis_image=vis_images, ir_image=ir_images, num_inference_steps=num_inf_steps
                 )
-            
-            # --- 5.2 计算奖励 ---
-            rewards = reward_fn(final_images)  # shape: (batch,)
-            if accelerator.is_main_process and test_run: print("Step 2: Reward calculation successful.")
-                
-            # --- 5.3 价值网络更新 或 使用 batch-based advantages ---
+            # latents_history: list len = steps+1, each (B, C, H, W)
+            # old_log_probs: (B, steps)
+
+            rewards = reward_fn(decoded)
+            # advantages
             if use_value_net and value_net is not None:
-                # 使用价值网络：构造 per-timestep target values 并训练 value_net
+                # train value net quickly
                 condition_embeds = encoder(torch.cat([vis_images, ir_images], dim=1))
-                # target_values: expand final reward 到每个 timestep
-                target_values = rewards.view(-1, 1).expand(-1, num_inf_steps).reshape(-1, 1)
+                # expand rewards per timestep
+                target_values = rewards.view(-1,1).expand(-1, num_inf_steps).reshape(-1,1)
+                # states: use latents_history[:-1] as states before action
+                states = torch.stack(latents_history[:-1], dim=1).view(-1, *latents_history[0].shape[1:])  # (B*steps, C,H,W)
+                timesteps_batch = scheduler.timesteps.unsqueeze(0).repeat(vis_images.shape[0],1).view(-1)
+                cond_batch = condition_embeds.repeat_interleave(num_inf_steps, dim=0)
 
-                # 将历史latents展平 (batch * num_steps, C, H, W)
-                states_batch = torch.stack(latents_history[:-1], dim=1).view(-1, *latents_history[0].shape[1:])
-                # timesteps_batch：重复 timesteps for batch
-                timesteps_batch = scheduler.timesteps.repeat(vis_images.shape[0])
-                condition_embeds_batch = condition_embeds.repeat_interleave(num_inf_steps, dim=0)
+                # simple value update steps
+                for _ in range(config['rl_training'].get('value_update_steps', 1)):
+                    preds = value_net(states, timesteps_batch, cond_batch)
+                    vloss = F.mse_loss(preds, target_values)
+                    accelerator.backward(vloss)
+                    value_optimizer.step(); value_optimizer.zero_grad()
 
-                for _ in range(config['rl_training']['value_update_steps']):
-                    predicted_values = value_net(states_batch, timesteps_batch, condition_embeds_batch)
-                    value_loss = F.mse_loss(predicted_values, target_values)
-                    
-                    accelerator.backward(value_loss)
-                    value_optimizer.step()
-                    value_optimizer.zero_grad()
-                if accelerator.is_main_process and test_run: print("Step 3: Value network update successful.")
-
-                # 计算 advantages = target - predicted (并标准化)
                 with torch.no_grad():
-                    predicted_values = value_net(states_batch, timesteps_batch, condition_embeds_batch)
-                    advantages = (target_values - predicted_values).view(vis_images.shape[0], num_inf_steps).mean(dim=1)
+                    preds = value_net(states, timesteps_batch, cond_batch).view(vis_images.shape[0], num_inf_steps)
+                    advantages = (target_values.view(vis_images.shape[0], num_inf_steps).mean(dim=1) - preds.mean(dim=1))
                     advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-                    # 为 policy 更新扩展到每个时刻的向量（flatten）
-                    advantages_expanded = advantages.view(-1,1).expand(-1, num_inf_steps).reshape(-1)
-            else:
-                # 不使用 value_net：直接使用 batch-based advantages（GRPO风格）
-                advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)  # shape (batch,)
-                # 扩展到每 timestep 的 advantage 向量（flatten）
                 advantages_expanded = advantages.view(-1,1).expand(-1, num_inf_steps).reshape(-1)
-                # 仍需构造 states_batch / timesteps_batch / condition_embeds_batch 用于后续计算
+            else:
+                advantages = (rewards - rewards.mean()) / (rewards.std() + 1e-8)
+                advantages_expanded = advantages.view(-1,1).expand(-1, num_inf_steps).reshape(-1)
                 condition_embeds = encoder(torch.cat([vis_images, ir_images], dim=1))
-                states_batch = torch.stack(latents_history[:-1], dim=1).view(-1, *latents_history[0].shape[1:])
-                timesteps_batch = scheduler.timesteps.repeat(vis_images.shape[0])
-                condition_embeds_batch = condition_embeds.repeat_interleave(num_inf_steps, dim=0)
-                if accelerator.is_main_process and test_run: print("Using batch advantages (no value net).")
-            
-            # --- 5.4 策略网络更新 ---
-            for _ in range(config['rl_training']['policy_update_steps']):
-                with torch.no_grad():
-                    # 如果使用 value_net，上面已生成 predicted_values 用于计算 advantages
-                    # 如果未使用，则 advantages_expanded 已准备好
-                    # 标准化已经在上面完成
-                    pass
-                
-                # 重新计算当前策略下的动作概率
-                noise_pred_train = unet(states_batch, timesteps_batch, condition_embeds_batch).sample
-                if config.get('rl_training', {}).get('use_kl', False):
-                    with torch.no_grad():
-                        noise_pred_ref = unet_ref(states_batch, timesteps_batch, condition_embeds_batch).sample
-                
-                # 计算 new_log_prob：ddim_step_with_logprob 支持向量化的 timestep 参数（timesteps_batch）
-                prev_samples_flat = torch.stack(latents_history[1:], dim=1).view(-1, *latents_history[0].shape[1:])
-                _, new_log_prob = ddim_step_with_logprob(
-                    scheduler, noise_pred_train, timesteps_batch, states_batch, 
-                    prev_sample=prev_samples_flat, eta=1.0
-                )
-                
-                # KL Loss (DPOK) 简化为预测噪声的MSE
-                if config.get('rl_training', {}).get('use_kl', False):
-                    if accelerator.is_main_process:
-                        print("rl_training.use_kl=True but KL loss is not implemented. Raising NotImplementedError.")
-                    raise NotImplementedError("KL loss computation not implemented. Set rl_training.use_kl=False to skip.")
-                else:
-                    kl_loss = torch.tensor(0.0, device=accelerator.device)
 
-                # PPO Clipped Loss (DDPO)
-                # new_log_prob 与 old_log_probs_flat 顺序需一致（均为 batch-major flatten）
-                old_log_probs_flat = old_log_probs.view(-1)
-                ratio = torch.exp(new_log_prob - old_log_probs_flat.to(new_log_prob.device))
-                unclipped_loss = -advantages_expanded.to(ratio.device) * ratio
-                clipped_loss = -advantages_expanded.to(ratio.device) * torch.clamp(ratio, 1.0 - config['rl_training']['ppo_clip_range'], 1.0 + config['rl_training']['ppo_clip_range'])
-                policy_loss = torch.mean(torch.maximum(unclipped_loss, clipped_loss))
-                
-                # 总损失
-                total_loss = config['rl_training']['reward_weight'] * policy_loss + config['rl_training']['kl_weight'] * kl_loss
-                
-                accelerator.backward(total_loss)
-                policy_optimizer.step()
-                policy_optimizer.zero_grad()
-            if accelerator.is_main_process and test_run: print("Step 4: Policy network update successful.")
+            # 使用 DDPO 风格的时间步采样与按步训练，避免一次性把 (B * steps) 展开到显存中
+            # 1) 形成张量 (B, steps+1, C, H, W) 与 old_log_probs (B, steps)
+            latents_tensor = torch.stack(latents_history, dim=1)  # (B, steps+1, C, H, W)
+            old_log_probs = old_log_probs  # (B, steps)
+            B = vis_images.shape[0]
+            num_steps = latents_tensor.shape[1] - 1  # 通常 == num_inf_steps
 
-        if test_run:
-            if accelerator.is_main_process: print("\n--- Test Run Successful! ---")
-            break # 测试运行只跑一个批次就退出
+            # --- NEW: 构造 advantages 的 (B, num_steps) 版本，便于按时间步索引 ---
+            # advantages 在上面已经计算为形状 (B,)（或 value_net 分支得到的 (B,)）
+            # 保证它的长度等于 batch size
+            if advantages.numel() != B:
+                # 兜底：若 advantages 被展平为 (B*num_steps,) 的形式，恢复到 (B,)
+                advantages = advantages.view(B, -1).mean(dim=1)
+            adv_matrix = advantages.view(B, 1).expand(B, num_steps)  # (B, num_steps)
 
-        # --- 6. 保存模型 ---
-        if (epoch + 1) % config['logging']['save_freq'] == 0 and accelerator.is_main_process:
+            # 2) 选择用于训练的时间步数量（timestep_fraction 避免训练全部时间步）
+            tf_frac = float(config['rl_training'].get('timestep_fraction', 0.4))
+            num_train_timesteps = max(1, int(num_steps * tf_frac))
+
+            # 3) 为训练构建小批次：按时间步循环，每步只移动当前 (B, C, H, W) 到 GPU
+            # 使用 accelerator.accumulate + 自动混合精度（若可用）减少显存与提高稳定性
+            autocast = accelerator.autocast
+            for _step_iter in range(config['rl_training'].get('policy_update_steps', 1)):
+                # 随机打乱时间维度以获得多样性（与 ddpo 一致）
+                perm = torch.randperm(num_steps, device=latents_tensor.device)[:num_train_timesteps]
+                for j in perm:
+                    # 使用已 prepare 的 model_wrapper 进行 accumulate / forward，避免 graph/模块不一致
+                    with accelerator.accumulate(model_wrapper):
+                        with autocast():
+                            # 当前与下一个状态
+                            state = latents_tensor[:, j].to(accelerator.device)
+                            next_state = latents_tensor[:, j + 1].to(accelerator.device)
+                            # timesteps 标量扩展为向量
+                            t_batch = scheduler.timesteps[j].to(accelerator.device).repeat(B)
+                            # 直接把原始条件图传入 wrapper，由 wrapper 内部调用 encoder
+                            noise_pred = model_wrapper(state, t_batch, condition_img)
+                            # model_wrapper 已保证返回 predicted noise tensor
+                            _, new_log_prob = ddim_step_with_logprob(scheduler, noise_pred, t_batch, state, prev_sample=next_state, eta=1.0)
+
+                        old_step = old_log_probs[:, j].to(new_log_prob.device)
+                        # ratio shape: (B,)
+                        ratio = torch.exp(new_log_prob - old_step)
+                        # 从 adv_matrix 取当前时间步的 advantage
+                        adv_step = adv_matrix[:, j].to(ratio.device)
+
+                        unclipped = -adv_step * ratio
+                        clipped = -adv_step * torch.clamp(ratio, 1.0 - config['rl_training']['ppo_clip_range'], 1.0 + config['rl_training']['ppo_clip_range'])
+                        policy_loss = torch.mean(torch.maximum(unclipped, clipped))
+
+                        total_loss = config['rl_training']['reward_weight'] * policy_loss
+                        if config['rl_training'].get('use_kl', False):
+                            kl_weight = float(config['rl_training'].get('kl_weight', 0.0))
+                            approx_kl = torch.mean(new_log_prob - old_step)
+                            total_loss = total_loss + kl_weight * approx_kl
+
+                        accelerator.backward(total_loss)
+                        if accelerator.sync_gradients:
+                            accelerator.clip_grad_norm_(unet.parameters(), config['rl_training'].get('max_grad_norm', 1.0))
+                        policy_optimizer.step()
+                        policy_optimizer.zero_grad()
+
+            # 显存整理
+
+            if accelerator.is_main_process and test_run:
+                print("Test step complete.")
+
+        # optional checkpoint save
+        if accelerator.is_main_process and (epoch+1) % config['logging']['save_freq'] == 0:
             save_dir = os.path.join(config['output_dir'], config['run_name'], f"epoch_{epoch+1}")
             os.makedirs(save_dir, exist_ok=True)
-            
-            # 使用accelerator保存unwrapped模型
-            unwrapped_unet = accelerator.unwrap_model(unet)
-            unwrapped_encoder = accelerator.unwrap_model(encoder)
-            
-            torch.save(unwrapped_unet.state_dict(), os.path.join(save_dir, "unet.pth"))
-            torch.save(unwrapped_encoder.state_dict(), os.path.join(save_dir, "encoder.pth"))
-            print(f"RL model saved to {save_dir}")
+            # unwrap model_wrapper，然后保存其子模块
+            unwrapped_wrapper = accelerator.unwrap_model(model_wrapper)
+            torch.save(unwrapped_wrapper.unet.state_dict(), os.path.join(save_dir, "unet.pth"))
+            torch.save(unwrapped_wrapper.encoder.state_dict(), os.path.join(save_dir, "encoder.pth"))
+            print(f"Saved checkpoint to {save_dir}")
 
-    if accelerator.is_main_process:
-        # 保存最终模型
-        save_dir = os.path.join(config['output_dir'], config['run_name'], "final")
-        os.makedirs(save_dir, exist_ok=True)
-        
-        # 使用accelerator保存unwrapped模型
-        unwrapped_unet = accelerator.unwrap_model(unet)
-        unwrapped_encoder = accelerator.unwrap_model(encoder)
-        
-        torch.save(unwrapped_unet.state_dict(), os.path.join(save_dir, "unet.pth"))
-        torch.save(unwrapped_encoder.state_dict(), os.path.join(save_dir, "encoder.pth"))
-        print(f"Final RL model saved to {save_dir}")
+        if test_run:
+            if accelerator.is_main_process:
+                print("Test run finished.")
+            break
+
+        if accelerator.is_main_process:
+            final_dir = os.path.join(config['output_dir'], config['run_name'], "final")
+            os.makedirs(final_dir, exist_ok=True)
+            unwrapped_wrapper = accelerator.unwrap_model(model_wrapper)
+            torch.save(unwrapped_wrapper.unet.state_dict(), os.path.join(final_dir, "unet.pth"))
+            torch.save(unwrapped_wrapper.encoder.state_dict(), os.path.join(final_dir, "encoder.pth"))
+            print(f"Saved final models to {final_dir}")
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--config", type=str, required=True, help="Path to the RL config file.")
-    parser.add_argument("--test_run", action="store_true", help="Run a test with dummy data.")
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--test_run", action="store_true")
     args = parser.parse_args()
-    
-    with open(args.config, 'r') as f:
-        config = yaml.safe_load(f)
-        
-    main(config, args.test_run)
+    main(args.config, args.test_run)

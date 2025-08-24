@@ -38,6 +38,15 @@ def _get_variance(scheduler, timestep, prev_timestep):
 def _infer_vae_scale(vae) -> int:
     return 4 # 不知道为什么，3次下采样实际缩放是4，可能和diffuser实现有关系
 
+# 新增：按通道自动选择可整除组数的 GroupNorm 创建器
+def _make_groupnorm(num_channels: int, max_groups: int = 32) -> nn.Module:
+    groups = min(max_groups, num_channels)
+    # 降低组数直到能整除通道数
+    while groups > 1 and (num_channels % groups != 0):
+        groups -= 1
+    # groups==1 时，相当于 LayerNorm 风格（在 GroupNorm 中）
+    return nn.GroupNorm(num_groups=groups, num_channels=num_channels)
+
 
 def ddim_step_with_logprob(
     scheduler: DDIMScheduler,
@@ -98,21 +107,22 @@ class ConditioningEncoder(nn.Module):
     小型ResNet风格的条件编码器，将拼接的VIS+IR图像(4通道)编码为特征序列。
     维持在10-30M参数范围内，处理速度快。
     """
-    def __init__(self, in_channels=4, out_channels=512, base_channels=64):
+    def __init__(self, in_channels=4, out_channels=512, base_channels=128, layer_blocks=(2,2,2)):
         super().__init__()
         
         # ResNet-style blocks
         self.conv1 = nn.Conv2d(in_channels, base_channels, kernel_size=7, stride=2, padding=3, bias=False)
-        self.bn1 = nn.BatchNorm2d(base_channels)
+        # 使用 GroupNorm 替代 BatchNorm，避免 diffusion 训练中 BatchNorm 的不稳定性
+        self.bn1 = _make_groupnorm(base_channels)
         self.relu = nn.ReLU(inplace=True)
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
         
-        # ResNet blocks (简化版)
-        self.layer1 = self._make_layer(base_channels, base_channels, 2, stride=1)
-        self.layer2 = self._make_layer(base_channels, base_channels*2, 2, stride=2)
-        self.layer3 = self._make_layer(base_channels*2, base_channels*4, 2, stride=2)
+        # allow configurable block counts (increase capacity)
+        self.layer1 = self._make_layer(base_channels, base_channels, layer_blocks[0], stride=1)
+        self.layer2 = self._make_layer(base_channels, base_channels*2, layer_blocks[1], stride=2)
+        self.layer3 = self._make_layer(base_channels*2, base_channels*4, layer_blocks[2], stride=2)
         
-        # 输出投影
+        # 输出投影，保持输出维度为 out_channels（通常与 UNet cross_attention_dim 对齐）
         self.final_conv = nn.Conv2d(base_channels*4, out_channels, kernel_size=1)
         
     def _make_layer(self, in_planes, planes, blocks, stride):
@@ -152,15 +162,15 @@ class BasicBlock(nn.Module):
     def __init__(self, in_planes, planes, stride=1):
         super(BasicBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(planes)
+        self.bn1 = _make_groupnorm(planes)
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(planes)
-        
+        self.bn2 = _make_groupnorm(planes)
+
         self.shortcut = nn.Sequential()
         if stride != 1 or in_planes != planes:
             self.shortcut = nn.Sequential(
                 nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(planes)
+                _make_groupnorm(planes)
             )
 
     def forward(self, x):
@@ -198,7 +208,7 @@ class ImageFusionPipeline(DiffusionPipeline):
         self,
         vis_image: torch.FloatTensor,
         ir_image: torch.FloatTensor,
-        num_inference_steps: int = 10,  # 默认10步
+        num_inference_steps: int = 20,  # 默认20步
         generator: Optional[torch.Generator] = None,
     ) -> torch.FloatTensor:
         device = self.device
@@ -234,7 +244,8 @@ class ImageFusionPipeline(DiffusionPipeline):
         # 对latents进行缩放（如果VAE有scaling_factor）
         if hasattr(self.vae.config, 'scaling_factor'):
             latents = latents / self.vae.config.scaling_factor
-        
+        # 加一行改用残差连接
+        latents = latents + self.vae.encode(vis_image.to(device=device, dtype=dtype)).latent_dist.sample()
         # AutoencoderKL.decode 通常接受 latents，返回一个包含 "sample" 的对象或 Tensor
         try:
             decoded = self.vae.decode(latents).sample
@@ -288,6 +299,14 @@ class ImageFusionPipeline(DiffusionPipeline):
         # 对latents进行缩放（如果VAE有scaling_factor）
         if hasattr(self.vae.config, 'scaling_factor'):
             final_latents = final_latents / self.vae.config.scaling_factor
+
+        # --- FIX: 加回 vis 的 residual latent（与 __call__ 保持一致） ---
+        # 确保 vis_image 的 device/dtype 与 final_latents 匹配
+        vis_for_encode = vis_image.to(device=device, dtype=dtype)
+        with torch.no_grad():
+            vis_latent = self.vae.encode(vis_for_encode).latent_dist.sample()
+        final_latents = final_latents + vis_latent
+        # --- end FIX ---
 
         try:
             decoded = self.vae.decode(final_latents).sample
@@ -362,7 +381,7 @@ if __name__ == "__main__":
     ir_image_vga = torch.randn(1, 1, 480, 640, device=device)
     
     start_time = time.time()
-    fused_image_vga = pipeline(vis_image_vga, ir_image_vga, num_inference_steps=10)
+    fused_image_vga = pipeline(vis_image_vga, ir_image_vga, num_inference_steps=20)
     end_time = time.time()
     time_vga = end_time - start_time
     
@@ -377,7 +396,7 @@ if __name__ == "__main__":
     ir_image_xga = torch.randn(1, 1, 768, 1024, device=device)
     
     start_time = time.time()
-    fused_image_xga = pipeline(vis_image_xga, ir_image_xga, num_inference_steps=10)
+    fused_image_xga = pipeline(vis_image_xga, ir_image_xga, num_inference_steps=20)
     end_time = time.time()
     time_xga = end_time - start_time
 
@@ -390,7 +409,7 @@ if __name__ == "__main__":
     # 使用640x480的图像进行概率测试
     with torch.no_grad():
         _, latents_history, old_log_probs = pipeline.forward_with_logprob(
-            vis_image_vga, ir_image_vga, num_inference_steps=10
+            vis_image_vga, ir_image_vga, num_inference_steps=20
         )
     
     print(f"Generated {len(latents_history)} latent states.")

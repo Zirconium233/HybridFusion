@@ -55,7 +55,7 @@ data:
   patch_size: 128
   augment: true
   train_batch_size: 4
-  num_inference_steps: 50
+  num_inference_steps: 20
 
 # 保存和日志
 logging:

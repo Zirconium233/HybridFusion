@@ -1,6 +1,6 @@
 # config/pretrain_config.yml
 
-run_name: "fusion_diffusion_pretrain_v1"
+run_name: "fusion_diffusion_pretrain_v2"
 output_dir: "./checkpoints/pretrain/"
 
 # 模型相关配置（分层：unet / encoder / vae）
@@ -17,7 +17,8 @@ model_config:
   encoder:
     in_channels: 4
     out_channels: 512
-    base_channels: 64
+    base_channels: 128
+    layer_blocks: [2, 2, 2]
 
   vae:
     sample_size: 128
@@ -33,11 +34,11 @@ model_config:
 
 
 diffusion:
-  num_inference_steps: 10
+  num_inference_steps: 20
   
 # 训练相关配置
 training:
-  num_epochs: 2000 # quick_test
+  num_epochs: 10 # quick_test
   train_batch_size: 16
   learning_rate: 1.0e-4
   optimizer:
@@ -48,11 +49,11 @@ training:
   scheduler:
     type: "CosineAnnealingLR"
     args:
-      T_max: 2000
+      T_max: 3000
       eta_min: 1.0e-6
   loss_function: "l1"
-  test_freq: 200
-  save_freq: 200
+  test_freq: 10
+  save_freq: 10
 
 # 数据集配置
 datasets:

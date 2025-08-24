@@ -171,7 +171,8 @@ def main(config_path):
 
                 vae.eval()
                 with torch.no_grad():
-                    lat_target = vae.encode(label_images).latent_dist.sample()
+                    # target改用残差
+                    lat_target = vae.encode(label_images).latent_dist.sample() - vae.encode(vis_images).latent_dist.sample()
                     lat_target *= scaling_factor
 
                 batch_size = lat_target.shape[0]
@@ -249,11 +250,13 @@ def main(config_path):
                         latents_shape = (B, lat_channels, lat_h, lat_w)
 
                         latents = torch.randn(latents_shape, device=device, dtype=unet_eval.dtype)
-                        diffusion_scheduler.set_timesteps(config['diffusion'].get('num_inference_steps', 10))
+                        diffusion_scheduler.set_timesteps(config['diffusion'].get('num_inference_steps', 20))
                         for t in diffusion_scheduler.timesteps:
                             noise_pred = unet_eval(latents, t, encoder_hidden_states=condition_embeds_test).sample
                             latents = diffusion_scheduler.step(noise_pred, t, latents).prev_sample
                         latents /= scaling_factor
+                        # 残差连接
+                        latents = latents + vae.encode(vis_test.to(device=device, dtype=model_dtype)).latent_dist.sample()
                         fused = vae.decode(latents).sample
 
                     # 检测模型输出 NaN（模型问题）
