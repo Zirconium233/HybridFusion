@@ -11,8 +11,9 @@ from tqdm.auto import tqdm
 import pandas as pd
 import numpy as np
 from diffusers import UNet2DConditionModel, DDIMScheduler, AutoencoderKL
+from diffusers.optimization import get_cosine_schedule_with_warmup
 
-from model.pipeline import ConditioningEncoder
+from model.pipeline import ConditioningEncoder, ddim_step_with_logprob
 from dataset import ImageFusionDataset
 import metric
 
@@ -43,6 +44,11 @@ def main(config_path):
     with open(args.config, 'r') as f:
         config = yaml.safe_load(f)
 
+    # 读取 pipeline 配置（不要在此处使用 accelerator）
+    pipeline_cfg = config.get("pipeline", {})
+    use_shortcut = bool(pipeline_cfg.get("use_shortcut", False))
+    use_ddim_logprob = bool(pipeline_cfg.get("use_ddim_logprob", False))
+
     project_dir = os.path.join(config.get('output_dir', "./checkpoints/pretrain/"), config['run_name'])
     os.makedirs(project_dir, exist_ok=True)
 
@@ -51,12 +57,15 @@ def main(config_path):
         project_dir=project_dir,
     )
 
+    # 现在 accelerator 已创建，可以安全打印
     if accelerator.is_main_process:
-        config_copy_path = os.path.join(project_dir, "config.yml")
-        shutil.copy2(args.config, config_copy_path)
-        print(f"Configuration saved to: {config_copy_path}")
-        print("Configuration:")
-        print(yaml.dump(config, indent=2))
+        print(f"Pipeline config: use_shortcut={use_shortcut}, use_ddim_logprob={use_ddim_logprob}")
+
+    config_copy_path = os.path.join(project_dir, "config.yml")
+    shutil.copy2(args.config, config_copy_path)
+    print(f"Configuration saved to: {config_copy_path}")
+    print("Configuration:")
+    print(yaml.dump(config, indent=2))
 
     # --- VAE Initialization ---
     vae_cfg = config['model_config'].get('vae')
@@ -101,16 +110,9 @@ def main(config_path):
     optimizer = OptimCls(model_wrapper.parameters(),
                          lr=config['training']['learning_rate'], **optimizer_config.get('args', {}))
 
-    scheduler_lr_config = config['training']['scheduler']
-    LRSchedulerCls = getattr(torch.optim.lr_scheduler, scheduler_lr_config['type'])
-    lr_scheduler = LRSchedulerCls(optimizer, **scheduler_lr_config.get('args', {}))
-    
-    diffusion_scheduler = DDIMScheduler(
-        num_train_timesteps=1000,
-        beta_schedule='squaredcos_cap_v2'
-    )
-
-    # --- DataLoaders ---
+    # 使用 diffusers 提供的 cosine schedule with warmup
+    # 需要知道总训练步数：len(train_loader) * num_epochs（train_loader 已创建下面）
+    # 因此先创建 train_loader（见下），然后再构建 lr_scheduler。
     train_ds_config = config['train_dataset']
     train_paths = config['datasets'][train_ds_config['name']]['train']
     train_dataset = ImageFusionDataset(
@@ -122,6 +124,32 @@ def main(config_path):
                               shuffle=True,
                               num_workers=config['training'].get('num_workers', 4),
                               pin_memory=True)
+
+    # 计算总训练步数并构建 lr_scheduler（支持配置 lr_warmup_steps 或 warmup.warmup_steps）
+    num_epochs = int(config['training']['num_epochs'])
+    steps_per_epoch = max(1, len(train_loader))
+    total_training_steps = num_epochs * steps_per_epoch
+
+    # 优先读取 top-level lr_warmup_steps，兼容旧 warmup 配置
+    warmup_cfg = config['training'].get('warmup', {}) if 'training' in config else {}
+    lr_warmup_steps = config['training'].get('lr_warmup_steps', None) or warmup_cfg.get('warmup_steps', None) or 0
+    lr_warmup_steps = int(lr_warmup_steps)
+
+    lr_scheduler = get_cosine_schedule_with_warmup(
+        optimizer=optimizer,
+        num_warmup_steps=lr_warmup_steps,
+        num_training_steps=total_training_steps,
+    )
+    if accelerator.is_main_process:
+        print(f"[LR] total_steps={total_training_steps}, warmup_steps={lr_warmup_steps}")
+
+    # --- Noise / Diffusion scheduler（必须初始化，供训练中的 add_noise 与测试采样使用） ---
+    diffusion_cfg = config.get("diffusion", {}) or {}
+    diffusion_num_train_timesteps = int(diffusion_cfg.get("num_train_timesteps", diffusion_cfg.get("num_inference_steps", 1000)))
+    diffusion_beta_schedule = diffusion_cfg.get("beta_schedule", "squaredcos_cap_v2")
+    diffusion_scheduler = DDIMScheduler(num_train_timesteps=diffusion_num_train_timesteps, beta_schedule=diffusion_beta_schedule)
+    if accelerator.is_main_process:
+        print(f"[Diffusion] DDIMScheduler initialized: num_train_timesteps={diffusion_num_train_timesteps}, beta_schedule={diffusion_beta_schedule}")
 
     test_loaders_list = []
     test_set_names = []
@@ -136,30 +164,86 @@ def main(config_path):
         test_loaders_list.append(DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False))
         test_set_names.append(set_name)
 
+    # --- LR Warmup wrapper（可选） ---
+    # 配置入口: config['training']['warmup'] -> {'warmup_steps': int} 或 {'warmup_ratio': float}
+    warmup_cfg = config['training'].get('warmup', {}) if 'training' in config else {}
+    warmup_steps = warmup_cfg.get('warmup_steps', None)
+    warmup_ratio = warmup_cfg.get('warmup_ratio', None)
+
+    # 如果用户只提供 warmup_ratio，则估算 warmup_steps = warmup_ratio * total_training_steps
+    if warmup_steps is None and warmup_ratio:
+        # 估计总 step = epochs * steps_per_epoch
+        steps_per_epoch = max(1, len(train_loader))
+        total_steps = int(config['training']['num_epochs'] * steps_per_epoch)
+        warmup_steps = int(max(0, warmup_ratio) * total_steps)
+
+    # 如果启用了预热且 warmup_steps>0，则用 SequentialLR 把 LinearLR (warmup) 和原 lr_scheduler 串联
+    if warmup_steps and warmup_steps > 0:
+        try:
+            # Linear warmup from 1e-6 * lr -> 1.0 * lr over warmup_steps
+            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-6, end_factor=1.0, total_iters=warmup_steps)
+            # SequentialLR 将在 warmup 完成后切换到原有 lr_scheduler
+            if hasattr(torch.optim.lr_scheduler, 'SequentialLR'):
+                lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
+            else:
+                # 旧版本回退：使用 LambdaLR 做线性 warmup，然后继续由 lr_scheduler 控制（注意：此路径可能需要手动 step 两个 scheduler）
+                def _warmup_lambda(step):
+                    if step >= warmup_steps:
+                        return 1.0
+                    return float(step) / float(max(1, warmup_steps))
+                lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_warmup_lambda)
+            if accelerator.is_main_process:
+                print(f"[LR] Enabled warmup: warmup_steps={warmup_steps}")
+        except Exception as e:
+            # 若构造失败则回退到原 lr_scheduler
+            if accelerator.is_main_process:
+                print(f"[LR] Warning: failed to enable warmup scheduler ({e}), continuing without warmup.")
+    else:
+        if accelerator.is_main_process:
+            print("[LR] Warmup disabled (no warmup_steps/warmup_ratio configured)")
+
     # --- Accelerate Preparation ---
-    # 修复：移除 vae，只准备需要训练的模型和数据加载器
-    components_to_prepare = [model_wrapper, optimizer, lr_scheduler, train_loader] + test_loaders_list
-    prepared_components = accelerator.prepare(*components_to_prepare)
-    
-    # 修复：重新解包，注意索引的变化
+    # 将 model, optimizer, dataloader, lr_scheduler 一起交给 accelerator.prepare（顺序需一致）
+    components_to_prepare = [model_wrapper, optimizer, train_loader, lr_scheduler] + test_loaders_list
+    prepared = accelerator.prepare(*components_to_prepare)
+
+    # 解包
     idx = 0
-    model_wrapper, optimizer, lr_scheduler, train_loader = prepared_components[idx:idx+4]; idx += 4
-    prepared_test_loaders_list = prepared_components[idx:]
+    model_wrapper, optimizer, train_loader, lr_scheduler = prepared[idx:idx+4]; idx += 4
+    prepared_test_loaders_list = prepared[idx:]
     prepared_test_loaders = dict(zip(test_set_names, prepared_test_loaders_list))
 
-    # 修复：手动将 VAE 移至设备，因为它没有被 accelerator.prepare 管理
-    # 给vae换成accelerator的dtype
+    # 将 VAE 移到 accelerator.device 并与模型 dtype 对齐（vae 未包含在 wrapper 中）
     device = accelerator.device
     model_dtype = next(model_wrapper.parameters()).dtype
     vae = vae.to(device, dtype=model_dtype)
 
-    loss_fn = F.l1_loss
+    # 选择损失函数（保持之前逻辑）
+    loss_name = config.get('training', {}).get('loss_function', 'l2')
+    loss_name = (loss_name or 'l2').lower()
+    if loss_name in ('l1', 'mae'):
+        loss_fn = F.l1_loss
+    elif loss_name in ('mse', 'l2'):
+        # 均方差（L2）
+        loss_fn = F.mse_loss
+    else:
+        # 未知配置则回退为 MSE，并打印警告（仅主进程可见）
+        if accelerator.is_main_process:
+            print(f"[Warning] Unknown loss_function '{loss_name}' in config, defaulting to 'mse'")
+        loss_fn = F.mse_loss
+
     num_train_epochs = config['training']['num_epochs']
     
-    # --- Training Loop ---
+    # 全局 step 计数，用于 step 级别日志
+    global_step = 0
+
+    # --- Training Loop: 在每次 optimizer.step() 后调用 lr_scheduler.step()（step-level 调度） ---
+    global_step = 0
     for epoch in range(num_train_epochs):
         model_wrapper.train()
-        
+        epoch_loss_sum = 0.0
+        epoch_loss_count = 0
+
         pbar = tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"Epoch {epoch+1}/{num_train_epochs}")
         for step, batch in enumerate(pbar):
             batch = tuple(t.to(device, dtype=model_dtype) for t in batch)
@@ -171,9 +255,15 @@ def main(config_path):
 
                 vae.eval()
                 with torch.no_grad():
-                    # target改用残差
-                    lat_target = vae.encode(label_images).latent_dist.sample() - vae.encode(vis_images).latent_dist.sample()
-                    lat_target *= scaling_factor
+                    if use_shortcut:
+                        # 教模型预测残差：label_lat - vis_lat（与 pipeline 加回 vis_lat 的行为一致）
+                        vis_lat = vae.encode(vis_images).latent_dist.sample()
+                        label_lat = vae.encode(label_images).latent_dist.sample()
+                        lat_target = (label_lat - vis_lat) * scaling_factor
+                    else:
+                        # 教模型直接预测 label latent（不依赖 shortcut），与推理时不加回 vis_lat 一致
+                        label_lat = vae.encode(label_images).latent_dist.sample()
+                        lat_target = label_lat * scaling_factor
 
                 batch_size = lat_target.shape[0]
                 timesteps = torch.randint(0, diffusion_scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
@@ -182,17 +272,42 @@ def main(config_path):
                 
                 condition_img = torch.cat([vis_images, ir_images], dim=1)
                 
+                # 计算 predicted_noise / loss
                 predicted_noise = model_wrapper(noisy_latent, timesteps, condition_img)
-                
                 loss = loss_fn(predicted_noise, noise)
+
                 accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    torch.nn.utils.clip_grad_norm_(model_wrapper.parameters(), config['training'].get('max_grad_norm', 1.0))
                 optimizer.step()
+                # 在 optimizer.step() 之后立即更新 lr（step-level 调度）
+                try:
+                    lr_scheduler.step()
+                except Exception:
+                    # 某些 scheduler 需要 step 时传入 epoch/step，兜底忽略
+                    pass
                 optimizer.zero_grad()
 
-            if accelerator.sync_gradients:
-                 pbar.set_postfix({"loss": loss.item(), "lr": lr_scheduler.get_last_lr()[0]})
+                # logging
+                epoch_loss_sum += loss.item()
+                epoch_loss_count += 1
+                global_step += 1
+                try:
+                    current_lr = lr_scheduler.get_last_lr()[0]
+                except Exception:
+                    current_lr = float(next(iter(optimizer.param_groups))['lr'])
+                accelerator.log({"train/step/loss": float(loss.item()), "train/step/lr": float(current_lr)}, step=global_step)
 
-        lr_scheduler.step()
+            if accelerator.sync_gradients:
+                pbar.set_postfix({"loss": loss.item(), "lr": current_lr})
+
+        # epoch 结束：记录 epoch 级别指标（lr 用 lr_scheduler.get_last_lr）
+        epoch_avg_loss = (epoch_loss_sum / epoch_loss_count) if epoch_loss_count > 0 else float('nan')
+        try:
+            epoch_lr = lr_scheduler.get_last_lr()[0]
+        except Exception:
+            epoch_lr = float(next(iter(optimizer.param_groups))['lr'])
+        accelerator.log({"train/epoch/loss": float(epoch_avg_loss), "train/epoch/lr": float(epoch_lr)}, step=epoch+1)
 
         # --- Testing Loop ---
         if (epoch + 1) % config['training']['test_freq'] == 0 and accelerator.is_main_process:
@@ -249,14 +364,32 @@ def main(config_path):
                         lat_channels = vae.config.latent_channels
                         latents_shape = (B, lat_channels, lat_h, lat_w)
 
+                        # 初始 latent（与 pipeline 保持一致）
                         latents = torch.randn(latents_shape, device=device, dtype=unet_eval.dtype)
                         diffusion_scheduler.set_timesteps(config['diffusion'].get('num_inference_steps', 20))
                         for t in diffusion_scheduler.timesteps:
-                            noise_pred = unet_eval(latents, t, encoder_hidden_states=condition_embeds_test).sample
-                            latents = diffusion_scheduler.step(noise_pred, t, latents).prev_sample
-                        latents /= scaling_factor
-                        # 残差连接
-                        latents = latents + vae.encode(vis_test.to(device=device, dtype=model_dtype)).latent_dist.sample()
+                            # 保存原始 x_t 用于可选 logprob 计算
+                            x_t = latents
+                            noise_pred = unet_eval(x_t, t, encoder_hidden_states=condition_embeds_test).sample
+                            step_out = diffusion_scheduler.step(noise_pred, t, x_t)
+                            prev_sample = step_out.prev_sample
+                            # 如果配置要求，尝试计算 ddin logprob（函数返回 prev_sample, log_prob）
+                            if use_ddim_logprob:
+                                try:
+                                    _, _ = ddim_step_with_logprob(diffusion_scheduler, noise_pred, t, x_t, prev_sample=prev_sample, eta=1.0)
+                                except Exception:
+                                    # 忽略 logprob 失败，不影响原本 sampling
+                                    pass
+                            latents = prev_sample
+
+                        # 反缩放
+                        if hasattr(vae.config, 'scaling_factor'):
+                            latents = latents / vae.config.scaling_factor
+
+                        # 根据 config 决定是否加回 vis latent（shortcut）
+                        if use_shortcut:
+                            latents = latents + vae.encode(vis_test.to(device=device, dtype=model_dtype)).latent_dist.sample()
+
                         fused = vae.decode(latents).sample
 
                     # 检测模型输出 NaN（模型问题）
@@ -352,6 +485,13 @@ def main(config_path):
             if results:
                 df = pd.DataFrame(results).T
                 print(df.to_string(float_format="%.4f"))
+                # 使用 accelerator.log 上报所有 test 指标（以 epoch 编号为 step）
+                # 组织为键值对： test/{set_name}/{metric_name} -> value
+                metrics_to_log = {}
+                for set_name_k, metrics_dict in results.items():
+                    for metric_k, val in metrics_dict.items():
+                        metrics_to_log[f"test/{set_name_k}/{metric_k}"] = float(val) if not np.isnan(val) else float('nan')
+                accelerator.log(metrics_to_log, step=epoch+1)
             print("--- Test Finished ---\n")
 
         # --- Saving Models ---

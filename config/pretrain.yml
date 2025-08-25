@@ -1,6 +1,6 @@
 # config/pretrain_config.yml
 
-run_name: "fusion_diffusion_pretrain_v2"
+run_name: "fusion_diffusion_pretrain_v3"
 output_dir: "./checkpoints/pretrain/"
 
 # 模型相关配置（分层：unet / encoder / vae）
@@ -38,22 +38,37 @@ diffusion:
   
 # 训练相关配置
 training:
-  num_epochs: 10 # quick_test
+  num_epochs: 3000
   train_batch_size: 16
-  learning_rate: 1.0e-4
+  # 建议基础学习率较保守：2e-5（可根据显存/bs再调）
+  learning_rate: 2.0e-5
   optimizer:
     type: "AdamW"
     args:
       weight_decay: 0.0001
       betas: [0.9, 0.999]
+  # Scheduler 类型留空（由代码使用 get_cosine_schedule_with_warmup 构建），保留旧字段兼容
   scheduler:
     type: "CosineAnnealingLR"
     args:
       T_max: 3000
       eta_min: 1.0e-6
-  loss_function: "l1"
-  test_freq: 10
-  save_freq: 10
+
+  # 优化器/训练细节
+  loss_function: "l2"
+  test_freq: 250
+  save_freq: 250
+
+  # step 级别 warmup，优先使用 lr_warmup_steps（步数）。若为空可配置 warmup.warmup_steps 保持兼容。
+  lr_warmup_steps: 2000
+  # 备用兼容项（旧配置）
+  warmup:
+    warmup_steps: 2000
+
+  # 混合精度与梯度累积
+  mixed_precision: "fp32"       # "no", "fp16" or "bf16"
+  gradient_accumulation_steps: 1
+  max_grad_norm: 1.0
 
 # 数据集配置
 datasets:
@@ -72,3 +87,12 @@ train_dataset:
 test_sets:
   - name: "MSRS"
     test_batch_size: 4
+
+pipeline:
+  # 是否在解码前把 vis 的 latent 加回到生成的 latent（残差 shortcut）。
+  # 默认关闭（留空或 False 表示关闭）
+  use_shortcut: false
+
+  # forward_with_logprob / debug 时是否启用 DDIM logprob 计算（会使用 pipeline 内的 ddim_step_with_logprob）
+  # 仅用于诊断/研究目的，默认关闭
+  use_ddim_logprob: false

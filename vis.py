@@ -18,11 +18,11 @@ import metric
 
 # --- 配置区域：根据实际调整 ---
 RUN_NAME = None  # 若已知设置为 "your_run_name"，否则留 None 自动选择 checkpoints/pretrain 下最新的 run
-PRETRAIN_BASE = "./checkpoints/pretrain/fusion_diffusion_pretrain_v2"
+PRETRAIN_BASE = "./checkpoints/pretrain/fusion_diffusion_pretrain_v3"
 VAE_FALLBACK = "./checkpoints/vae/best.pth"
 NUM_SHOW_BATCHES = 1   # 每个数据集展示多少个批次
 NUM_INFERENCE_STEPS = 20
-SAVE_DIR = 'save_images/v2'
+SAVE_DIR = 'save_images/v3'
 
 # --- 自动查找 run_dir 和 config.yml ---
 if RUN_NAME is None:
@@ -269,6 +269,7 @@ def run_and_report(loader, name, max_batches=NUM_SHOW_BATCHES):
                 axs[2].imshow(label_uint8[i].transpose(1,2,0)); axs[2].set_title("Label"); axs[2].axis("off")
             plt.suptitle(f"{name} batch{batch_idx} sample{i}")
             # plt.show()
+            plt.savefig(f"./{SAVE_DIR}/{name}_b{batch_idx}_s{i}_compare.png")
             out_path = f"./{SAVE_DIR}/{name}_b{batch_idx}_s{i}.png"
             plt.imsave(out_path, fused_uint8[i].transpose(1,2,0))
         batch_idx += 1

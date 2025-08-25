@@ -183,20 +183,21 @@ class BasicBlock(nn.Module):
 
 class ImageFusionPipeline(DiffusionPipeline):
     """
-    使用小号VAE的图像融合Pipeline：
-    - 使用 diffusers.AutoencoderKL 创建一个小 VAE（编码/解码器）
-    - 在 VAE 的潜空间上做扩散（显著减少计算量与内存）
-    - 最终通过 VAE decode 得到 RGB 图像
+    使用小号VAE的图像融合Pipeline。
+    新增参数:
+      - use_shortcut: 是否在最终 latent 上加回 vis 的 latent (残差 shortcut)
+      - use_ddim_logprob: forward_with_logprob 时是否使用 ddim_step_with_logprob 计算 logprob
     """
-    def __init__(self, unet: UNet2DConditionModel, scheduler: DDIMScheduler, encoder: ConditioningEncoder, vae: AutoencoderKL, vae_scale_factor: Optional[int] = None):
+    def __init__(self, unet: UNet2DConditionModel, scheduler: DDIMScheduler, encoder: ConditioningEncoder, vae: AutoencoderKL, vae_scale_factor: Optional[int] = None, use_shortcut: bool = False, use_ddim_logprob: bool = False):
         super().__init__()
         # 注册模块
         self.register_modules(unet=unet, scheduler=scheduler, encoder=encoder, vae=vae)
-        # VAE 的像素 -> 潜空间缩放比例（通常为8）
-        # 如果调用者没有显式传入，就根据 vae 配置推断真实的 scale
         self.vae_scale_factor = vae_scale_factor if vae_scale_factor is not None else _infer_vae_scale(vae)
         if vae_scale_factor is None:
             print(f"[Info] inferred vae_scale_factor={self.vae_scale_factor} from vae.config")
+        # 新增配置
+        self.use_shortcut = bool(use_shortcut)
+        self.use_ddim_logprob = bool(use_ddim_logprob)
 
     @property
     def device(self):
@@ -208,22 +209,22 @@ class ImageFusionPipeline(DiffusionPipeline):
         self,
         vis_image: torch.FloatTensor,
         ir_image: torch.FloatTensor,
-        num_inference_steps: int = 20,  # 默认20步
+        num_inference_steps: int = 20,
         generator: Optional[torch.Generator] = None,
     ) -> torch.FloatTensor:
         device = self.device
         dtype = self.unet.dtype
 
-        # 强制输入尺寸可被 vae_scale_factor 整除，保证解码后恢复到原始分辨率
+        # 强制输入尺寸可被 vae_scale_factor 整除
         _, _, H, W = vis_image.shape
         if H % self.vae_scale_factor != 0 or W % self.vae_scale_factor != 0:
             raise ValueError(f"输入 H,W 必须能被 vae_scale_factor({self.vae_scale_factor}) 整除，当前 H={H}, W={W}")
         
-        # 1. [条件编码] 使用独立的编码器处理拼接后的条件图像
+        # 条件编码
         condition_img = torch.cat([vis_image, ir_image], dim=1).to(device=device, dtype=dtype)
         condition_embeds = self.encoder(condition_img)
         
-        # 2. 在 VAE 潜空间上进行扩散推理
+        # 潜空间采样
         b, _, H, W = vis_image.shape
         latent_h = H // self.vae_scale_factor
         latent_w = W // self.vae_scale_factor
@@ -236,25 +237,26 @@ class ImageFusionPipeline(DiffusionPipeline):
         timesteps = self.scheduler.timesteps
         
         for t in timesteps:
-            # U-Net 接收的是潜空间的 latents
             noise_pred = self.unet(latents, t, encoder_hidden_states=condition_embeds).sample
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
 
-        # 3. 解码为 RGB 图像
-        # 对latents进行缩放（如果VAE有scaling_factor）
+        # 解码前按 VAE 的 scaling_factor 反缩放
         if hasattr(self.vae.config, 'scaling_factor'):
             latents = latents / self.vae.config.scaling_factor
-        # 加一行改用残差连接
-        latents = latents + self.vae.encode(vis_image.to(device=device, dtype=dtype)).latent_dist.sample()
-        # AutoencoderKL.decode 通常接受 latents，返回一个包含 "sample" 的对象或 Tensor
+
+        # 可选：是否启用 residual shortcut（加回 vis latent）
+        if self.use_shortcut:
+            vis_for_encode = vis_image.to(device=device, dtype=dtype)
+            with torch.no_grad():
+                vis_lat = self.vae.encode(vis_for_encode).latent_dist.sample()
+            latents = latents + vis_lat
+
         try:
             decoded = self.vae.decode(latents).sample
         except Exception:
-            # 兼容不同 diffusers 版本返回 dict 的场景
             out = self.vae.decode(latents)
             decoded = out["sample"] if isinstance(out, dict) and "sample" in out else out
 
-        # decoded 形状应为 (B, 3, H, W)
         return decoded
 
     @torch.no_grad()
@@ -262,7 +264,7 @@ class ImageFusionPipeline(DiffusionPipeline):
         self,
         vis_image: torch.FloatTensor,
         ir_image: torch.FloatTensor,
-        num_inference_steps: int = 10,  # 默认10步
+        num_inference_steps: int = 10,
         generator: Optional[torch.Generator] = None,
     ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
         device = self.device
@@ -285,28 +287,32 @@ class ImageFusionPipeline(DiffusionPipeline):
 
         for t in timesteps:
             noise_pred = self.unet(latents, t, encoder_hidden_states=condition_embeds).sample
-            next_latents = self.scheduler.step(noise_pred, t, latents).prev_sample
-            _, log_prob = ddim_step_with_logprob(
-                self.scheduler, noise_pred, t, latents,
-                prev_sample=next_latents, eta=1.0,
-            )
-            all_latents.append(next_latents)
-            all_log_probs.append(log_prob)
-            latents = next_latents
+            # step 得到 prev_sample（与原行为兼容）
+            next_step = self.scheduler.step(noise_pred, t, latents)
+            prev_sample = next_step.prev_sample
+            # 如果启用 ddin logprob，则用文件内实现的函数计算 logprob（否则填 0）
+            if self.use_ddim_logprob:
+                # ddim_step_with_logprob 返回 (prev_sample, log_prob)
+                _, log_prob = ddim_step_with_logprob(self.scheduler, noise_pred, t, latents, prev_sample=prev_sample, eta=1.0)
+                all_log_probs.append(log_prob)
+            else:
+                # 兼容形状：batch 维长度
+                all_log_probs.append(torch.zeros(b, device=device, dtype=dtype))
+            latents = prev_sample
+            all_latents.append(latents)
 
         final_latents = latents
 
-        # 对latents进行缩放（如果VAE有scaling_factor）
+        # 对 latents 做 scaling_factor 反缩放
         if hasattr(self.vae.config, 'scaling_factor'):
             final_latents = final_latents / self.vae.config.scaling_factor
 
-        # --- FIX: 加回 vis 的 residual latent（与 __call__ 保持一致） ---
-        # 确保 vis_image 的 device/dtype 与 final_latents 匹配
-        vis_for_encode = vis_image.to(device=device, dtype=dtype)
-        with torch.no_grad():
-            vis_latent = self.vae.encode(vis_for_encode).latent_dist.sample()
-        final_latents = final_latents + vis_latent
-        # --- end FIX ---
+        # 仅在配置允许时加回 vis latent
+        if self.use_shortcut:
+            vis_for_encode = vis_image.to(device=device, dtype=dtype)
+            with torch.no_grad():
+                vis_latent = self.vae.encode(vis_for_encode).latent_dist.sample()
+            final_latents = final_latents + vis_latent
 
         try:
             decoded = self.vae.decode(final_latents).sample
@@ -314,7 +320,8 @@ class ImageFusionPipeline(DiffusionPipeline):
             out = self.vae.decode(final_latents)
             decoded = out["sample"] if isinstance(out, dict) and "sample" in out else out
 
-        log_probs_history = torch.stack(all_log_probs, dim=1) # (batch, steps)
+        # stack log probs -> (batch, steps)
+        log_probs_history = torch.stack(all_log_probs, dim=1)
         
         return decoded, all_latents, log_probs_history
 
@@ -361,8 +368,8 @@ if __name__ == "__main__":
     encoder = ConditioningEncoder(in_channels=4, out_channels=unet_config['cross_attention_dim'])
     
     # 将固定的 vae_scale_factor 显式传入 pipeline，确保后续计算使用 /4
-    pipeline = ImageFusionPipeline(unet=unet, scheduler=scheduler, encoder=encoder, vae=vae, vae_scale_factor=vae_scale_factor).to(device)
-    
+    pipeline = ImageFusionPipeline(unet=unet, scheduler=scheduler, encoder=encoder, vae=vae, vae_scale_factor=vae_scale_factor, use_shortcut=False, use_ddim_logprob=False).to(device)
+
     # 计算参数量
     params_unet = sum(p.numel() for p in pipeline.unet.parameters() if p.requires_grad)
     params_encoder = sum(p.numel() for p in pipeline.encoder.parameters() if p.requires_grad)
