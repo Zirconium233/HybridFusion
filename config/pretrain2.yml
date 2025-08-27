@@ -6,13 +6,26 @@ output_dir: "./checkpoints/pretrain/"
 # 模型相关配置（分层：unet / encoder / vae）
 model_config:
   unet:
-    block_out_channels: [64, 128, 256, 256]
-    down_block_types: ["DownBlock2D", "CrossAttnDownBlock2D", "CrossAttnDownBlock2D", "DownBlock2D"]
-    up_block_types: ["UpBlock2D", "CrossAttnUpBlock2D", "CrossAttnUpBlock2D", "UpBlock2D"]
+    sample_size: 160  # the target image resolution with vae
+    in_channels: 4  # the number of input channels, 3 for RGB images
+    out_channels: 4  # the number of output channels
+    layers_per_block: 2  # how many ResNet layers to use per UNet block
+    block_out_channels: [128, 128, 256, 256, 512, 512]  # the number of output channels for each UNet block
+    down_block_types:
+      - "DownBlock2D"  # a regular ResNet downsampling block
+      - "DownBlock2D"
+      - "DownBlock2D"
+      - "DownBlock2D"
+      - "AttnDownBlock2D"  # a ResNet downsampling block with spatial self-attention
+      - "DownBlock2D"
+    up_block_types:
+      - "UpBlock2D"  # a regular ResNet upsampling block
+      - "AttnUpBlock2D"  # a ResNet upsampling block with spatial self-attention
+      - "UpBlock2D"
+      - "UpBlock2D"
+      - "UpBlock2D"
+      - "UpBlock2D"
     cross_attention_dim: 512
-    in_channels: 4
-    out_channels: 4
-    sample_size: 160
 
   encoder:
     in_channels: 8
@@ -21,16 +34,7 @@ model_config:
     layer_blocks: [2, 2, 2]
 
   vae:
-    sample_size: 128
-    in_channels: 3
-    out_channels: 3
-    down_block_types: ["DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"]
-    up_block_types: ["UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"]
-    block_out_channels: [64, 128, 256]
-    latent_channels: 4
-    # scale_factor: 4
-    scaling_factor: 0.057867
-    checkpoint_dir: "./checkpoints/vae/best.pth"
+    pretrain: "/home/zhangran/desktop/myProject/playground/sd-vae-ft-mse"
 
 
 diffusion:
@@ -39,9 +43,9 @@ diffusion:
   
 # 训练相关配置
 training:
-  num_epochs: 3000
+  num_epochs: 5000
   train_batch_size: 16
-  learning_rate: 1.0e-4
+  learning_rate: 2.0e-5
   optimizer:
     type: "AdamW"
     args:
@@ -51,7 +55,7 @@ training:
   scheduler:
     type: "CosineAnnealingLR"
     args:
-      T_max: 3000
+      T_max: 5000
       eta_min: 1.0e-6
 
   # 优化器/训练细节

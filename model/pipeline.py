@@ -215,16 +215,29 @@ class ImageFusionPipeline(DiffusionPipeline):
         device = self.device
         dtype = self.unet.dtype
 
-        # 强制输入尺寸可被 vae_scale_factor 整除
+        # 原像素大小检查保留
         _, _, H, W = vis_image.shape
         if H % self.vae_scale_factor != 0 or W % self.vae_scale_factor != 0:
             raise ValueError(f"输入 H,W 必须能被 vae_scale_factor({self.vae_scale_factor}) 整除，当前 H={H}, W={W}")
         
-        # 条件编码
-        condition_img = torch.cat([vis_image, ir_image], dim=1).to(device=device, dtype=dtype)
-        condition_embeds = self.encoder(condition_img)
+        # 根据 encoder 输入通道判断是否使用 latent 条件（效率：一次 encode vis+ir）
+        latent_channels = getattr(self.vae.config, "latent_channels", 4)
+        cond_in_ch = getattr(self.encoder.conv1, "in_channels", None)
+        use_latent_condition = (cond_in_ch == latent_channels * 2)
+
+        if use_latent_condition:
+            ir_for_encode = ir_image.repeat(1, 3, 1, 1) if ir_image.shape[1] == 1 else ir_image
+            enc = self.vae.encode(torch.cat([vis_image, ir_for_encode], dim=0))
+            lat_all = enc.latent_dist.sample() if hasattr(enc, "latent_dist") else (enc[0] if isinstance(enc, (tuple, list)) else enc)
+            B = vis_image.shape[0]
+            vis_lat_c, ir_lat_c = lat_all[:B], lat_all[B:2*B]
+            condition_input = torch.cat([vis_lat_c, ir_lat_c], dim=1).to(device=device, dtype=dtype)
+        else:
+            condition_input = torch.cat([vis_image, ir_image], dim=1).to(device=device, dtype=dtype)
+
+        condition_embeds = self.encoder(condition_input)
         
-        # 潜空间采样
+        # 潜空间采样保持不变
         b, _, H, W = vis_image.shape
         latent_h = H // self.vae_scale_factor
         latent_w = W // self.vae_scale_factor
@@ -240,11 +253,9 @@ class ImageFusionPipeline(DiffusionPipeline):
             noise_pred = self.unet(latents, t, encoder_hidden_states=condition_embeds).sample
             latents = self.scheduler.step(noise_pred, t, latents).prev_sample
 
-        # 解码前按 VAE 的 scaling_factor 反缩放
         if hasattr(self.vae.config, 'scaling_factor'):
             latents = latents / self.vae.config.scaling_factor
 
-        # 可选：是否启用 residual shortcut（加回 vis latent）
         if self.use_shortcut:
             vis_for_encode = vis_image.to(device=device, dtype=dtype)
             with torch.no_grad():
@@ -269,9 +280,24 @@ class ImageFusionPipeline(DiffusionPipeline):
     ) -> Tuple[torch.Tensor, List[torch.Tensor], torch.Tensor]:
         device = self.device
         dtype = self.unet.dtype
-        condition_img = torch.cat([vis_image, ir_image], dim=1).to(device=device, dtype=dtype)
-        condition_embeds = self.encoder(condition_img)
 
+        # 条件：像素 or latent（一次 encode vis+ir）
+        latent_channels = getattr(self.vae.config, "latent_channels", 4)
+        cond_in_ch = getattr(self.encoder.conv1, "in_channels", None)
+        use_latent_condition = (cond_in_ch == latent_channels * 2)
+        if use_latent_condition:
+            ir_for_encode = ir_image.repeat(1, 3, 1, 1) if ir_image.shape[1] == 1 else ir_image
+            enc = self.vae.encode(torch.cat([vis_image, ir_for_encode], dim=0))
+            lat_all = enc.latent_dist.sample() if hasattr(enc, "latent_dist") else (enc[0] if isinstance(enc, (tuple, list)) else enc)
+            B = vis_image.shape[0]
+            vis_lat_c, ir_lat_c = lat_all[:B], lat_all[B:2*B]
+            condition_input = torch.cat([vis_lat_c, ir_lat_c], dim=1).to(device=device, dtype=dtype)
+        else:
+            condition_input = torch.cat([vis_image, ir_image], dim=1).to(device=device, dtype=dtype)
+
+        condition_embeds = self.encoder(condition_input)
+
+        # 其余保持不变
         b, _, H, W = vis_image.shape
         latent_h = H // self.vae_scale_factor
         latent_w = W // self.vae_scale_factor
@@ -287,27 +313,21 @@ class ImageFusionPipeline(DiffusionPipeline):
 
         for t in timesteps:
             noise_pred = self.unet(latents, t, encoder_hidden_states=condition_embeds).sample
-            # step 得到 prev_sample（与原行为兼容）
             next_step = self.scheduler.step(noise_pred, t, latents)
             prev_sample = next_step.prev_sample
-            # 如果启用 ddin logprob，则用文件内实现的函数计算 logprob（否则填 0）
             if self.use_ddim_logprob:
-                # ddim_step_with_logprob 返回 (prev_sample, log_prob)
                 _, log_prob = ddim_step_with_logprob(self.scheduler, noise_pred, t, latents, prev_sample=prev_sample, eta=1.0)
                 all_log_probs.append(log_prob)
             else:
-                # 兼容形状：batch 维长度
                 all_log_probs.append(torch.zeros(b, device=device, dtype=dtype))
             latents = prev_sample
             all_latents.append(latents)
 
         final_latents = latents
 
-        # 对 latents 做 scaling_factor 反缩放
         if hasattr(self.vae.config, 'scaling_factor'):
             final_latents = final_latents / self.vae.config.scaling_factor
 
-        # 仅在配置允许时加回 vis latent
         if self.use_shortcut:
             vis_for_encode = vis_image.to(device=device, dtype=dtype)
             with torch.no_grad():
@@ -320,7 +340,6 @@ class ImageFusionPipeline(DiffusionPipeline):
             out = self.vae.decode(final_latents)
             decoded = out["sample"] if isinstance(out, dict) and "sample" in out else out
 
-        # stack log probs -> (batch, steps)
         log_probs_history = torch.stack(all_log_probs, dim=1)
         
         return decoded, all_latents, log_probs_history
@@ -330,24 +349,12 @@ if __name__ == "__main__":
     print("--- 1. Model Initialization ---")
     device = "cuda" if torch.cuda.is_available() else "cpu"
     
-    # VAE 小号配置（使用 diffusers.AutoencoderKL）
-    # 下面明确构造一个下采样 3 次（2^3 == 8）的 VAE：下采样因子正好为 4
-    vae_latent_channels = 4
-    # 选择 3 个 down block => 下采样 2^3 = 4
-    vae = AutoencoderKL(
-        sample_size=128,  # 样例用 128，实际使用时保证 H,W 可被 4 整除
-        in_channels=3,
-        out_channels=3,
-        down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
-        up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
-        block_out_channels=(64, 128, 256),  # 与 down block 数量对应
-        latent_channels=vae_latent_channels,
-        scaling_factor=0.057867
-    )
-
-    # 明确指定 4 倍下采样（无需再推断/测量）
-    vae_scale_factor = 4
-    print(f"[Info] using fixed vae_scale_factor={vae_scale_factor} (3 down blocks => 2^3=8 ? 4! diffusers )")
+    # Use pretrained VAE instead of custom VAE
+    vae = AutoencoderKL.from_pretrained("/home/zhangran/desktop/myProject/playground/sd-vae-ft-mse")
+    vae_latent_channels = vae.config.latent_channels
+    vae_scale_factor = 8  # Pretrained VAE uses 8x downsampling
+    scaling_factor = vae.config.scaling_factor
+    print(f"[Info] using pretrained VAE: latent_channels={vae_latent_channels}, scale_factor={vae_scale_factor}, scaling_factor={scaling_factor}")
  
      # U-Net 配置 - 输入通道应匹配 VAE 的潜空间通道数
     unet_config = {
@@ -357,7 +364,7 @@ if __name__ == "__main__":
          'cross_attention_dim': 512,  # 匹配encoder输出
          'in_channels': vae_latent_channels,    # 改为 VAE 潜空间通道
          'out_channels': vae_latent_channels,   # 输出也在潜空间
-         'sample_size': 640 // vae_scale_factor,  # UNet 在潜空间的空间尺寸（示例）
+         'sample_size': 640 // vae_scale_factor,  # UNet 在潜空间的空间尺寸（640//8=80）
     }
     unet = UNet2DConditionModel(**unet_config)
     
@@ -365,10 +372,13 @@ if __name__ == "__main__":
     scheduler = DDIMScheduler(num_train_timesteps=1000, beta_schedule='squaredcos_cap_v2')
     
     # 初始化我们的条件编码器 - 匹配unet的cross_attention_dim
-    encoder = ConditioningEncoder(in_channels=4, out_channels=unet_config['cross_attention_dim'])
+    encoder = ConditioningEncoder(in_channels=vae_latent_channels*2, out_channels=unet_config['cross_attention_dim'])
     
-    # 将固定的 vae_scale_factor 显式传入 pipeline，确保后续计算使用 /4
-    pipeline = ImageFusionPipeline(unet=unet, scheduler=scheduler, encoder=encoder, vae=vae, vae_scale_factor=vae_scale_factor, use_shortcut=False, use_ddim_logprob=False).to(device)
+    # 改为开启 logprob 计算，避免 forward_with_logprob 返回全 0
+    pipeline = ImageFusionPipeline(
+        unet=unet, scheduler=scheduler, encoder=encoder, vae=vae,
+        vae_scale_factor=vae_scale_factor, use_shortcut=False, use_ddim_logprob=True
+    ).to(device)
 
     # 计算参数量
     params_unet = sum(p.numel() for p in pipeline.unet.parameters() if p.requires_grad)
@@ -423,7 +433,7 @@ if __name__ == "__main__":
     print(f"Log probabilities shape: {old_log_probs.shape}")
     print(f"Sample log prob values: {old_log_probs[0, :5]}")  # 前5步的log prob
     
-    # 测试loss计算
+    # 测试loss计算（使用 LATENT 条件，而不是像素 3+1）
     dummy_rewards = torch.randn(1, device=device)
     advantages = (dummy_rewards - dummy_rewards.mean())
     
@@ -432,10 +442,22 @@ if __name__ == "__main__":
     next_latents_action = latents_history[t_idx+1]
     old_log_prob_t = old_log_probs[:, t_idx]
     
-    # 模拟一次带梯度的前向传播
+    # 构造与 pipeline 一致的 latent 条件：一次性编码 vis+ir
+    with torch.no_grad():
+        ir_vga_for_encode = ir_image_vga.repeat(1, 3, 1, 1) if ir_image_vga.shape[1] == 1 else ir_image_vga
+        enc_pair = pipeline.vae.encode(torch.cat([vis_image_vga, ir_vga_for_encode], dim=0))
+        lat_pair = enc_pair.latent_dist.sample() if hasattr(enc_pair, "latent_dist") else (
+            enc_pair[0] if isinstance(enc_pair, (tuple, list)) else enc_pair
+        )
+        Bv = vis_image_vga.shape[0]
+        vis_lat_vga, ir_lat_vga = lat_pair[:Bv], lat_pair[Bv:2*Bv]
+        cond_input_vga = torch.cat([vis_lat_vga, ir_lat_vga], dim=1)
+
+    # 模拟一次带梯度的前向传播（确保 dtype/device 一致）
     pipeline.unet.train()
-    condition_embeds = pipeline.encoder(torch.cat([vis_image_vga, ir_image_vga], dim=1))
+    condition_embeds = pipeline.encoder(cond_input_vga.to(device=pipeline.device, dtype=pipeline.unet.dtype))
     noise_pred_new = pipeline.unet(current_latents, scheduler.timesteps[t_idx], condition_embeds).sample
+    # 重新计算该步的 log_prob（使用和 forward_with_logprob 一致的 DDIM 公式）
     _, new_log_prob_t = ddim_step_with_logprob(
         pipeline.scheduler, noise_pred_new, scheduler.timesteps[t_idx], current_latents, 
         eta=1.0, prev_sample=next_latents_action

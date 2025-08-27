@@ -72,33 +72,46 @@ def main(config_path):
     if vae_cfg is None:
         raise RuntimeError("VAE configuration missing. Pretraining requires a VAE.")
 
-    vae_init_kwargs = {k: v for k, v in vae_cfg.items() if k != 'checkpoint_dir'}
-    vae = AutoencoderKL(**vae_init_kwargs)
-    
-    if 'scaling_factor' not in vae.config or vae.config.scaling_factor is None:
-        raise ValueError("VAE config in yaml MUST contain 'scaling_factor' with the calculated value.")
+    # Check if using pretrained VAE
+    if 'pretrain' in vae_cfg:
+        pretrain_path = vae_cfg['pretrain']
+        if accelerator.is_main_process:
+            print(f"Loading pretrained VAE from: {pretrain_path}")
+        vae = AutoencoderKL.from_pretrained(pretrain_path)
+        if accelerator.is_main_process:
+            print("Pretrained VAE loaded successfully.")
+    else:
+        vae_init_kwargs = {k: v for k, v in vae_cfg.items() if k != 'checkpoint_dir'}
+        vae = AutoencoderKL(**vae_init_kwargs)
+        
+        if 'scaling_factor' not in vae.config or vae.config.scaling_factor is None:
+            raise ValueError("VAE config in yaml MUST contain 'scaling_factor' with the calculated value.")
+        
+        vae_ckpt = find_vae_checkpoint(ckpt_dir=vae_cfg.get('checkpoint_dir', "./checkpoints/vae/best.pth"))
+        if vae_ckpt is None:
+            raise RuntimeError(f"No VAE checkpoint found at the specified path: {vae_cfg.get('checkpoint_dir')}.")
+        
+        if accelerator.is_main_process:
+            print(f"Loading VAE checkpoint from {vae_ckpt}")
+        
+        sd = torch.load(vae_ckpt, map_location="cpu")
+        if isinstance(sd, dict) and 'model_state_dict' in sd:
+            sd = sd['model_state_dict']
+        
+        vae.load_state_dict(sd, strict=True)
+        print("VAE checkpoint loaded successfully in strict mode.")
     
     scaling_factor = vae.config.scaling_factor
     if accelerator.is_main_process:
         print(f"Successfully loaded VAE scaling_factor: {scaling_factor}")
 
-    vae_scale_factor = 4  # Hardcoded downsampling factor
+    # Set downsampling factor based on VAE type
+    if 'pretrain' in vae_cfg:
+        vae_scale_factor = 8  # Pretrained VAE uses 8x downsampling
+    else:
+        vae_scale_factor = 4  # Custom VAE uses 4x downsampling
     if accelerator.is_main_process:
-        print(f"Using HARDCODED VAE downsampling scale factor: {vae_scale_factor}")
-
-    vae_ckpt = find_vae_checkpoint(ckpt_dir=vae_cfg.get('checkpoint_dir', "./checkpoints/vae/best.pth"))
-    if vae_ckpt is None:
-        raise RuntimeError(f"No VAE checkpoint found at the specified path: {vae_cfg.get('checkpoint_dir')}.")
-    
-    if accelerator.is_main_process:
-        print(f"Loading VAE checkpoint from {vae_ckpt}")
-    
-    sd = torch.load(vae_ckpt, map_location="cpu")
-    if isinstance(sd, dict) and 'model_state_dict' in sd:
-        sd = sd['model_state_dict']
-    
-    vae.load_state_dict(sd, strict=True)
-    print("VAE checkpoint loaded successfully in strict mode.")
+        print(f"Using VAE downsampling scale factor: {vae_scale_factor}")
 
     # --- Model and Optimizer Initialization ---
     unet = UNet2DConditionModel(**config['model_config']['unet'])
@@ -145,11 +158,104 @@ def main(config_path):
 
     # --- Noise / Diffusion scheduler（必须初始化，供训练中的 add_noise 与测试采样使用） ---
     diffusion_cfg = config.get("diffusion", {}) or {}
-    diffusion_num_train_timesteps = int(diffusion_cfg.get("num_train_timesteps", diffusion_cfg.get("num_inference_steps", 1000)))
+    diffusion_num_train_timesteps = int(diffusion_cfg.get("num_train_timesteps", 1000))
     diffusion_beta_schedule = diffusion_cfg.get("beta_schedule", "squaredcos_cap_v2")
     diffusion_scheduler = DDIMScheduler(num_train_timesteps=diffusion_num_train_timesteps, beta_schedule=diffusion_beta_schedule)
     if accelerator.is_main_process:
         print(f"[Diffusion] DDIMScheduler initialized: num_train_timesteps={diffusion_num_train_timesteps}, beta_schedule={diffusion_beta_schedule}")
+    # 判断是否采用 VAE latent 作为条件（encoder 输入通道为 latent*2 即启用）
+    use_latent_condition = (
+        int(config['model_config']['encoder']['in_channels'])
+        == int(config['model_config']['vae'].get('latent_channels', 4)) * 2
+    )
+    if accelerator.is_main_process:
+        print(f"Using latent condition: {use_latent_condition}")
+    # --- Precompute VAE latents for training set (store in memory) ---
+    # 目标：将训练时会用到的 VAE 编码在训练前一次性计算好，避免训练循环中重复走 VAE。
+    # 预计算并构造成新的 DataLoader：每个样本 -> (condition_input, lat_target)
+    class InMemoryLatentDataset(torch.utils.data.Dataset):
+        def __init__(self, conditions: torch.Tensor, targets: torch.Tensor):
+            self.conditions = conditions
+            self.targets = targets
+        def __len__(self):
+            return self.conditions.shape[0]
+        def __getitem__(self, idx):
+            return self.conditions[idx], self.targets[idx]
+
+    # 仅针对训练集做 VAE 预编码；测试集仍按原逻辑在线处理
+    # 使用与训练相同的 batch_size 进行预计算，减少显存峰值
+    pre_bs = config['training']['train_batch_size']
+    pre_dl = DataLoader(
+        train_dataset,
+        batch_size=pre_bs,
+        shuffle=False,
+        num_workers=config['training'].get('num_workers', 4),
+        pin_memory=True,
+    )
+
+    # 在预计算阶段把 VAE 放到设备上（使用 fp32 以保证稳定性），并设为 eval/no_grad
+    vae_device = accelerator.device
+    vae = vae.to(vae_device)
+    vae.eval()
+    precomputed_conditions: list[torch.Tensor] = []
+    precomputed_targets: list[torch.Tensor] = []
+    from math import ceil
+    pbar = tqdm(pre_dl, disable=not accelerator.is_main_process, desc="Precomputing VAE latents")
+    with torch.no_grad():
+        for batch in pbar:
+            # 期望 batch 为 (vis, ir, label)
+            if not isinstance(batch, (tuple, list)) or len(batch) < 3:
+                raise RuntimeError(f"Train dataset must return (vis, ir, label), got {type(batch)} with len={len(batch) if hasattr(batch, '__len__') else 'N/A'}")
+            vis_images, ir_images, label_images = batch
+            # 将输入送到 VAE 所在设备（fp32）
+            vis_images = vis_images.to(device=vae_device, dtype=torch.float32, non_blocking=True)
+            ir_images = ir_images.to(device=vae_device, dtype=torch.float32, non_blocking=True)
+            label_images = label_images.to(device=vae_device, dtype=torch.float32, non_blocking=True)
+
+            # 计算训练目标 latent（lat_target）
+            if use_shortcut:
+                vis_lat = vae.encode(vis_images).latent_dist.sample()
+                label_lat = vae.encode(label_images).latent_dist.sample()
+                lat_target = (label_lat - vis_lat) * scaling_factor
+            else:
+                label_lat = vae.encode(label_images).latent_dist.sample()
+                lat_target = label_lat * scaling_factor
+
+            # 计算条件输入：像素 or latent（保持与训练循环一致逻辑）
+            if use_latent_condition:
+                # 若 IR 单通道，重复到 3 通道后再共同编码
+                ir_in = ir_images.repeat(1, 3, 1, 1) if ir_images.shape[1] == 1 else ir_images
+                enc_out = vae.encode(torch.cat([vis_images, ir_in], dim=0))
+                lat_all = enc_out.latent_dist.sample() if hasattr(enc_out, "latent_dist") else (
+                    enc_out[0] if isinstance(enc_out, (tuple, list)) else enc_out
+                )
+                B = vis_images.shape[0]
+                vis_lat_c, ir_lat_c = lat_all[:B], lat_all[B:2*B]
+                condition_input = torch.cat([vis_lat_c, ir_lat_c], dim=1)
+            else:
+                condition_input = torch.cat([vis_images, ir_images], dim=1)
+
+            # 将结果转存到 CPU，使用 float16 节省内存（训练时会按需转到 device/dtype）
+            precomputed_conditions.append(condition_input.detach().to(device="cpu", dtype=torch.float16))
+            precomputed_targets.append(lat_target.detach().to(device="cpu", dtype=torch.float16))
+
+    # 拼接为单个大张量，并构建新的 DataLoader
+    if len(precomputed_conditions) == 0:
+        raise RuntimeError("No training samples found during VAE precompute.")
+    all_conditions = torch.cat(precomputed_conditions, dim=0)
+    all_targets = torch.cat(precomputed_targets, dim=0)
+    # 安全检查：长度一致
+    if all_conditions.shape[0] != all_targets.shape[0]:
+        raise RuntimeError(f"Precomputed sizes mismatch: conditions={all_conditions.shape[0]} vs targets={all_targets.shape[0]}")
+    # 替换训练 DataLoader 为内存数据集版本
+    inmem_ds = InMemoryLatentDataset(all_conditions, all_targets)
+    train_loader = DataLoader(
+        inmem_ds,
+        batch_size=config['training']['train_batch_size'],
+        shuffle=True,
+        num_workers=config['training'].get('num_workers', 4),
+        pin_memory=True,
+    )
 
     test_loaders_list = []
     test_set_names = []
@@ -237,8 +343,7 @@ def main(config_path):
     # 全局 step 计数，用于 step 级别日志
     global_step = 0
 
-    # --- Training Loop: 在每次 optimizer.step() 后调用 lr_scheduler.step()（step-level 调度） ---
-    global_step = 0
+    # --- Training Loop ---
     for epoch in range(num_train_epochs):
         model_wrapper.train()
         epoch_loss_sum = 0.0
@@ -246,34 +351,48 @@ def main(config_path):
 
         pbar = tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"Epoch {epoch+1}/{num_train_epochs}")
         for step, batch in enumerate(pbar):
+            # 支持两种 batch 形态：
+            # 1) 预计算路径：(condition_input, lat_target)
+            # 2) 旧路径：(vis_images, ir_images, label_images)
             batch = tuple(t.to(device, dtype=model_dtype) for t in batch)
             with accelerator.accumulate(model_wrapper):
-                if len(batch) != 3:
-                    raise RuntimeError(f"Training requires labels (dir_C). Batch provided has {len(batch)} items.")
-                
-                vis_images, ir_images, label_images = batch
-
-                vae.eval()
-                with torch.no_grad():
-                    if use_shortcut:
-                        # 教模型预测残差：label_lat - vis_lat（与 pipeline 加回 vis_lat 的行为一致）
-                        vis_lat = vae.encode(vis_images).latent_dist.sample()
-                        label_lat = vae.encode(label_images).latent_dist.sample()
-                        lat_target = (label_lat - vis_lat) * scaling_factor
+                if len(batch) == 2:
+                    condition_input, lat_target = batch
+                elif len(batch) == 3:
+                    vis_images, ir_images, label_images = batch
+                    # 在线路径：仍保留旧逻辑（但正常不会进入，因为已使用预计算 DataLoader）
+                    vae.eval()
+                    with torch.no_grad():
+                        if use_shortcut:
+                            vis_lat = vae.encode(vis_images).latent_dist.sample()
+                            label_lat = vae.encode(label_images).latent_dist.sample()
+                            lat_target = (label_lat - vis_lat) * scaling_factor
+                        else:
+                            label_lat = vae.encode(label_images).latent_dist.sample()
+                            lat_target = label_lat * scaling_factor
+                    if use_latent_condition:
+                        with torch.no_grad():
+                            ir_in = ir_images.repeat(1, 3, 1, 1) if ir_images.shape[1] == 1 else ir_images
+                            enc_out = vae.encode(torch.cat([vis_images, ir_in], dim=0))
+                            lat_all = enc_out.latent_dist.sample() if hasattr(enc_out, "latent_dist") else (
+                                enc_out[0] if isinstance(enc_out, (tuple, list)) else enc_out
+                            )
+                            B = vis_images.shape[0]
+                            vis_lat_c, ir_lat_c = lat_all[:B], lat_all[B:2*B]
+                            condition_input = torch.cat([vis_lat_c, ir_lat_c], dim=1)
                     else:
-                        # 教模型直接预测 label latent（不依赖 shortcut），与推理时不加回 vis_lat 一致
-                        label_lat = vae.encode(label_images).latent_dist.sample()
-                        lat_target = label_lat * scaling_factor
+                        condition_input = torch.cat([vis_images, ir_images], dim=1)
+                else:
+                    raise RuntimeError(f"Unexpected batch size: expected 2 or 3 elements, got {len(batch)}")
 
+                # 时刻/加噪
                 batch_size = lat_target.shape[0]
                 timesteps = torch.randint(0, diffusion_scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
                 noise = torch.randn_like(lat_target)
                 noisy_latent = diffusion_scheduler.add_noise(lat_target, noise, timesteps)
-                
-                condition_img = torch.cat([vis_images, ir_images], dim=1)
-                
+
                 # 计算 predicted_noise / loss
-                predicted_noise = model_wrapper(noisy_latent, timesteps, condition_img)
+                predicted_noise = model_wrapper(noisy_latent, timesteps, condition_input)
                 loss = loss_fn(predicted_noise, noise)
 
                 accelerator.backward(loss)
@@ -356,8 +475,16 @@ def main(config_path):
                     vis_test, ir_test = batch[0], batch[1]
 
                     with torch.no_grad():
-                        condition_img_test = torch.cat([vis_test, ir_test], dim=1)
-                        condition_embeds_test = encoder_eval(condition_img_test)
+                        # 条件：像素 or latent（一次 encode vis+ir，仅 IR repeat）
+                        if use_latent_condition:
+                            ir_t = ir_test.repeat(1, 3, 1, 1) if ir_test.shape[1] == 1 else ir_test
+                            enc_out_t = vae.encode(torch.cat([vis_test, ir_t], dim=0))
+                            lat_all_t = enc_out_t.latent_dist.sample() if hasattr(enc_out_t, "latent_dist") else (enc_out_t[0] if isinstance(enc_out_t, (tuple, list)) else enc_out_t)
+                            B_t = vis_test.shape[0]
+                            vis_lat_t, ir_lat_t = lat_all_t[:B_t], lat_all_t[B_t:2*B_t]
+                            condition_embeds_test = encoder_eval(torch.cat([vis_lat_t, ir_lat_t], dim=1))
+                        else:
+                            condition_embeds_test = encoder_eval(torch.cat([vis_test, ir_test], dim=1))
 
                         B, _, H, W = vis_test.shape
                         lat_h, lat_w = H // vae_scale_factor, W // vae_scale_factor
