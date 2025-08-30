@@ -320,13 +320,13 @@ class FusionLoss(nn.Module):
     """
     def __init__(
         self,
-        max_ratio: float = 24.0,
-        consist_ratio: float = 40.0,
-        grad_ratio: float = 48.0,       # 原实现的 text_ratio（实为texture/gradient项）
+        max_ratio: float = 10.0,
+        consist_ratio: float = 2.0,
+        grad_ratio: float = 40.0,       # 原实现的 text_ratio（实为texture/gradient项）
         ssim_ir_ratio: float = 1.0,
-        ssim_ratio: float = 2.0,
-        ir_compose: float = 1.0,
-        color_ratio: float = 12.0,
+        ssim_ratio: float = 1.0,
+        ir_compose: float = 2.0,
+        color_ratio: float = 2.0,
         max_mode: str = "l1",
         consist_mode: str = "l1",
         ssim_window_size: int = 48

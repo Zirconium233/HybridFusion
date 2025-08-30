@@ -8,6 +8,7 @@ from random import randrange
 import torch.nn.functional as F
 from torchvision.transforms import Compose, ToTensor, Normalize
 import torchvision.transforms as transforms
+from collections import Counter
 
 import cv2
 
@@ -120,8 +121,8 @@ class ImageFusionDataset(data.Dataset):
                  is_ycbcrA=False,
                  is_ycbcrB=False,
                  is_ycbcrC=False,
-                 transform=transform(),
-                 scale=1):
+                 transform=None,
+                  scale=1):
         super(ImageFusionDataset, self).__init__()
         self.dir_A = dir_A
         self.dir_B = dir_B
@@ -154,6 +155,29 @@ class ImageFusionDataset(data.Dataset):
             n = min(len(self.A_image_filenames), len(self.B_image_filenames))
             self.A_image_filenames = self.A_image_filenames[:n]
             self.B_image_filenames = self.B_image_filenames[:n]
+
+        # 如果没有提供 transform，自动统计 A/B 中最常见分辨率并在原 transform 前加 Resize
+        if self.transform is None:
+            def _most_common_size(paths):
+                sizes = []
+                for p in paths:
+                    try:
+                        with Image.open(p) as im:
+                            sizes.append(im.size)  # PIL: (width, height)
+                    except:
+                        continue
+                if not sizes:
+                    return None
+                return Counter(sizes).most_common(1)[0][0]
+
+            combined = self.A_image_filenames + self.B_image_filenames
+            most = _most_common_size(combined)
+            if most is not None:
+                w, h = most
+                resize_size = (h, w)  # torchvision.Resize expects (H, W)
+                self.transform = Compose([transforms.Resize(resize_size), ToTensor(), Normalize([0.5], [0.5])])
+            else:
+                self.transform = Compose([ToTensor(), Normalize([0.5], [0.5])])
 
     def __len__(self):
         return len(self.A_image_filenames)
@@ -218,13 +242,19 @@ if __name__ == "__main__":
     default_train_A = './data/MSRS-main/MSRS-main/train/vi'
     default_train_B = './data/MSRS-main/MSRS-main/train/ir'
     default_train_C = './data/MSRS-main/MSRS-main/train/label'
-    default_test_A = './data/MSRS-main/MSRS-main/test/vi'
-    default_test_B = './data/MSRS-main/MSRS-main/test/ir'
+    # M3FD:
+    # "dir_A": "./data/M3FD_Fusion/Vis",
+    # "dir_B": "./data/M3FD_Fusion/Ir",
+    default_test_A = './data/M3FD_Fusion/Vis'
+    default_test_B = './data/M3FD_Fusion/Ir'
+    # RS:
+
 
     if args.train:
         dirA, dirB, dirC = default_train_A, default_train_B, default_train_C
     else:
         dirA, dirB = default_test_A, default_test_B
+        dirC = None
 
     ds = ImageFusionDataset(
         dir_A=dirA,
@@ -242,7 +272,7 @@ if __name__ == "__main__":
     loader = DataLoader(ds, batch_size=4, shuffle=True, num_workers=2, drop_last=False)
     print(f"Dataset size: {len(ds)}, running one epoch test...")
     total = 0
-    for batch_idx, (A, B, C) in enumerate(loader):
+    for batch_idx, (A, B) in enumerate(loader):
         total += A.size(0)
-        print(f"Batch {batch_idx}: A {tuple(A.shape)}, B {tuple(B.shape)}, C {tuple(C.shape)}")
+        print(f"Batch {batch_idx}: A {tuple(A.shape)}, B {tuple(B.shape)}")
     print(f"Finished epoch, total samples: {total}")
