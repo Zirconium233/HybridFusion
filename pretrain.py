@@ -55,6 +55,8 @@ def main(config_path):
     accelerator = Accelerator(
         log_with="tensorboard",
         project_dir=project_dir,
+        mixed_precision=config.get('training', {}).get('mixed_precision', 'no'),
+        gradient_accumulation_steps=config.get('training', {}).get('gradient_accumulation_steps', 1),
     )
 
     # 现在 accelerator 已创建，可以安全打印
@@ -223,7 +225,6 @@ def main(config_path):
 
             # 计算条件输入：像素 or latent（保持与训练循环一致逻辑）
             if use_latent_condition:
-                # 若 IR 单通道，重复到 3 通道后再共同编码
                 ir_in = ir_images.repeat(1, 3, 1, 1) if ir_images.shape[1] == 1 else ir_images
                 enc_out = vae.encode(torch.cat([vis_images, ir_in], dim=0))
                 lat_all = enc_out.latent_dist.sample() if hasattr(enc_out, "latent_dist") else (
@@ -235,9 +236,9 @@ def main(config_path):
             else:
                 condition_input = torch.cat([vis_images, ir_images], dim=1)
 
-            # 将结果转存到 CPU，使用 float16 节省内存（训练时会按需转到 device/dtype）
-            precomputed_conditions.append(condition_input.detach().to(device="cpu", dtype=torch.float16))
-            precomputed_targets.append(lat_target.detach().to(device="cpu", dtype=torch.float16))
+            # 改为 CPU 上的 float32 缓存
+            precomputed_conditions.append(condition_input.detach().to(device="cpu", dtype=torch.float32))
+            precomputed_targets.append(lat_target.detach().to(device="cpu", dtype=torch.float32))
 
     # 拼接为单个大张量，并构建新的 DataLoader
     if len(precomputed_conditions) == 0:
@@ -269,44 +270,6 @@ def main(config_path):
         test_batch_size = test_set_config.get('test_batch_size', 4)
         test_loaders_list.append(DataLoader(test_dataset, batch_size=test_batch_size, shuffle=False))
         test_set_names.append(set_name)
-
-    # --- LR Warmup wrapper（可选） ---
-    # 配置入口: config['training']['warmup'] -> {'warmup_steps': int} 或 {'warmup_ratio': float}
-    warmup_cfg = config['training'].get('warmup', {}) if 'training' in config else {}
-    warmup_steps = warmup_cfg.get('warmup_steps', None)
-    warmup_ratio = warmup_cfg.get('warmup_ratio', None)
-
-    # 如果用户只提供 warmup_ratio，则估算 warmup_steps = warmup_ratio * total_training_steps
-    if warmup_steps is None and warmup_ratio:
-        # 估计总 step = epochs * steps_per_epoch
-        steps_per_epoch = max(1, len(train_loader))
-        total_steps = int(config['training']['num_epochs'] * steps_per_epoch)
-        warmup_steps = int(max(0, warmup_ratio) * total_steps)
-
-    # 如果启用了预热且 warmup_steps>0，则用 SequentialLR 把 LinearLR (warmup) 和原 lr_scheduler 串联
-    if warmup_steps and warmup_steps > 0:
-        try:
-            # Linear warmup from 1e-6 * lr -> 1.0 * lr over warmup_steps
-            warmup_scheduler = torch.optim.lr_scheduler.LinearLR(optimizer, start_factor=1e-6, end_factor=1.0, total_iters=warmup_steps)
-            # SequentialLR 将在 warmup 完成后切换到原有 lr_scheduler
-            if hasattr(torch.optim.lr_scheduler, 'SequentialLR'):
-                lr_scheduler = torch.optim.lr_scheduler.SequentialLR(optimizer, schedulers=[warmup_scheduler, lr_scheduler], milestones=[warmup_steps])
-            else:
-                # 旧版本回退：使用 LambdaLR 做线性 warmup，然后继续由 lr_scheduler 控制（注意：此路径可能需要手动 step 两个 scheduler）
-                def _warmup_lambda(step):
-                    if step >= warmup_steps:
-                        return 1.0
-                    return float(step) / float(max(1, warmup_steps))
-                lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=_warmup_lambda)
-            if accelerator.is_main_process:
-                print(f"[LR] Enabled warmup: warmup_steps={warmup_steps}")
-        except Exception as e:
-            # 若构造失败则回退到原 lr_scheduler
-            if accelerator.is_main_process:
-                print(f"[LR] Warning: failed to enable warmup scheduler ({e}), continuing without warmup.")
-    else:
-        if accelerator.is_main_process:
-            print("[LR] Warmup disabled (no warmup_steps/warmup_ratio configured)")
 
     # --- Accelerate Preparation ---
     # 将 model, optimizer, dataloader, lr_scheduler 一起交给 accelerator.prepare（顺序需一致）

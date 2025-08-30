@@ -123,16 +123,14 @@ def group_images_by_adjusted_size(files):
     return groups
 
 
+# 预训练与保存路径（按你的要求）
+PRETRAINED_VAE_DIR = "/home/zhangran/desktop/myProject/playground/sd-vae-ft-mse"
+SAVE_FINETUNED_DIR = "/home/zhangran/desktop/myProject/playground/Image/checkpoints/vae/sd-vae-ft"
+
+
 def build_vae(vae_latent_channels=4):
-    vae = AutoencoderKL(
-        sample_size=128,
-        in_channels=3,
-        out_channels=3,
-        down_block_types=("DownEncoderBlock2D", "DownEncoderBlock2D", "DownEncoderBlock2D"),
-        up_block_types=("UpDecoderBlock2D", "UpDecoderBlock2D", "UpDecoderBlock2D"),
-        block_out_channels=(64, 128, 256),
-        latent_channels=vae_latent_channels,
-    )
+    # 使用预训练权重初始化，进行微调
+    vae = AutoencoderKL.from_pretrained(PRETRAINED_VAE_DIR)
     return vae
 
 
@@ -192,8 +190,8 @@ def main():
         print("No valid 1- or 3-channel images found.")
         return
 
-    # 像素阈值: 1024*768
-    PIXEL_LIMIT = 1024 * 768
+    # 像素阈值: 1024*768 改为 300
+    PIXEL_LIMIT = 300 * 300
 
     # 过滤太大的 size（直接忽略）
     filtered_groups = {}
@@ -212,6 +210,15 @@ def main():
     groups = filtered_groups
     if not groups:
         print("No groups under pixel limit to train on. Exiting.")
+        return
+
+    # 新增：过滤小样本尺寸分组（样本数 <= 20 的直接丢弃，避免污染微调）
+    small_groups = {size: len(flist) for size, flist in groups.items() if len(flist) <= 20}
+    groups = {size: flist for size, flist in groups.items() if len(flist) > 20}
+    if small_groups:
+        print(f"Dropped size-groups with too few images (<=20): {small_groups}")
+    if not groups:
+        print("No size-groups with >20 images remain after filtering. Exiting.")
         return
 
     if has_accelerate:
@@ -394,6 +401,16 @@ def main():
 
     if is_main:
         print("Training complete.")
+
+    # 新增：保存微调后的 VAE 为 diffusers 兼容格式（save_pretrained）
+    if is_main:
+        try:
+            os.makedirs(SAVE_FINETUNED_DIR, exist_ok=True)
+            model_to_save = accelerator.unwrap_model(vae) if accelerator is not None else vae
+            model_to_save.save_pretrained(SAVE_FINETUNED_DIR)
+            print(f"Saved fine-tuned VAE to {SAVE_FINETUNED_DIR}")
+        except Exception as e:
+            print(f"Failed to save_pretrained to {SAVE_FINETUNED_DIR}: {e}")
 
 
 if __name__ == "__main__":

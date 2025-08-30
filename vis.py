@@ -47,19 +47,28 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 # --- 构建模型结构并加载权重 ---
 # 1) VAE
 vae_cfg = config["model_config"]["vae"]
-vae_init_kwargs = {k: v for k, v in vae_cfg.items() if k != "checkpoint_dir"}
-vae = AutoencoderKL(**vae_init_kwargs)
-vae_ckpt_path = vae_cfg.get("checkpoint_dir", VAE_FALLBACK)
-if not os.path.exists(vae_ckpt_path):
-    raise FileNotFoundError(f"VAE checkpoint not found at {vae_ckpt_path}")
-sd = torch.load(vae_ckpt_path, map_location="cpu")
-if isinstance(sd, dict) and "model_state_dict" in sd:
-    sd = sd["model_state_dict"]
-vae.load_state_dict(sd, strict=True)
-vae.to(device).eval()
-scaling_factor = getattr(vae.config, "scaling_factor", None)
-if scaling_factor is None:
-    raise RuntimeError("vae.config.scaling_factor missing")
+vae_scale_factor = None
+if "pretrain" in vae_cfg:
+    # 优先：配置里显式给出预训练/微调目录
+    vae = AutoencoderKL.from_pretrained(vae_cfg["pretrain"]).to(device)
+    vae.eval()
+    scaling_factor = vae.config.scaling_factor
+    vae_scale_factor = 8
+else:
+    # 回退：按旧规则从 state_dict 加载（自定义 VAE，4x 下采样）
+    vae_init_kwargs = {k: v for k, v in vae_cfg.items() if k != "checkpoint_dir"}
+    vae = AutoencoderKL(**vae_init_kwargs)
+    vae_ckpt_path = vae_cfg.get("checkpoint_dir", VAE_FALLBACK)
+    if not os.path.exists(vae_ckpt_path):
+        raise FileNotFoundError(f"VAE checkpoint not found at {vae_ckpt_path}")
+    sd = torch.load(vae_ckpt_path, map_location="cpu")
+    if isinstance(sd, dict) and "model_state_dict" in sd:
+        sd = sd["model_state_dict"]
+    vae.load_state_dict(sd, strict=True)
+    vae.to(device).eval()
+    scaling_factor = getattr(vae.config, "scaling_factor", None)
+    if scaling_factor is None:
+        raise RuntimeError("vae.config.scaling_factor missing")
 
 # 2) UNet & Encoder
 unet_cfg = config["model_config"]["unet"]
@@ -102,7 +111,28 @@ num_train_timesteps = 1000
 scheduler = DDIMScheduler(num_train_timesteps=num_train_timesteps, beta_schedule="squaredcos_cap_v2")
 
 # 构造 pipeline
-pipeline = ImageFusionPipeline(unet=unet, scheduler=scheduler, encoder=encoder, vae=vae, vae_scale_factor=4).to(device)
+pipeline = ImageFusionPipeline(unet=unet, scheduler=scheduler, encoder=encoder, vae=vae, vae_scale_factor=vae_scale_factor).to(device)
+
+# 自动判断是否采用 latent 条件（enc_in == latent_ch*2 即为 latent 模式）
+latent_ch = int(getattr(vae.config, "latent_channels", 4))
+enc_in_ch = int(getattr(getattr(encoder, "conv1", None), "in_channels", 0) or 0)
+USE_LATENT_COND = (enc_in_ch == latent_ch * 2)
+USE_SHORTCUT = bool(config.get("pipeline", {}).get("use_shortcut", False))
+
+def build_condition_input(vis_tensor: torch.Tensor, ir_tensor: torch.Tensor) -> torch.Tensor:
+    # 依据 USE_LATENT_COND 构造 encoder 的输入；效率优化：一次性 encode vis||ir
+    if USE_LATENT_COND:
+        ir_in = ir_tensor.repeat(1, 3, 1, 1) if ir_tensor.shape[1] == 1 else ir_tensor
+        with torch.no_grad():
+            enc = vae.encode(torch.cat([vis_tensor, ir_in], dim=0))
+            lat = enc.latent_dist.sample() if hasattr(enc, "latent_dist") else (
+                enc[0] if isinstance(enc, (tuple, list)) else enc
+            )
+        B = vis_tensor.shape[0]
+        vis_lat, ir_lat = lat[:B], lat[B:2*B]
+        return torch.cat([vis_lat, ir_lat], dim=1)
+    else:
+        return torch.cat([vis_tensor, ir_tensor], dim=1)
 
 # --- 数据集 loaders（参考 pretrain.py） ---
 train_ds_config = config["train_dataset"]
@@ -206,43 +236,33 @@ def run_and_report(loader, name, max_batches=NUM_SHOW_BATCHES):
         losses = None
         if label is not None:
             with torch.no_grad():
-                # encode target latent
-                enc = vae.encode(label)
-                lat_target = getattr(enc, "latent_dist", None)
-                if lat_target is not None:
-                    try:
-                        lat_target = enc.latent_dist.sample()
-                    except Exception:
-                        lat_target = enc.latent_dist.mean
-                elif isinstance(enc, dict):
-                    lat_target = enc.get("latent_dist", enc.get("sample", torch.as_tensor(enc))).sample \
-                                 if "latent_dist" in enc or "sample" in enc else torch.as_tensor(enc)
-                else:
-                    lat_target = enc
-                lat_target = lat_target.to(device)
-                lat_target = lat_target - vae.encode(vis.to(device)).latent_dist.sample() # residual
+                # 一次性 encode [label, vis] -> 避免两次 encode
+                enc_tv = vae.encode(torch.cat([label, vis], dim=0))
+                lat_all = enc_tv.latent_dist.sample() if hasattr(enc_tv, "latent_dist") else (
+                    enc_tv[0] if isinstance(enc_tv, (tuple, list)) else enc_tv
+                )
+                Bn = label.shape[0]
+                label_lat, vis_lat = lat_all[:Bn], lat_all[Bn:2*Bn]
+                lat_target = (label_lat - vis_lat) if USE_SHORTCUT else label_lat
                 lat_target = lat_target * scaling_factor
 
                 # random timesteps & noise (proxy estimate of training loss)
-                B = lat_target.shape[0]
-                ts = torch.randint(0, scheduler.config.num_train_timesteps, (B,), device=device).long()
+                ts = torch.randint(0, scheduler.config.num_train_timesteps, (Bn,), device=device).long()
                 noise = torch.randn_like(lat_target)
-                try:
-                    noisy = scheduler.add_noise(lat_target, noise, ts)
-                except Exception:
-                    noisy = lat_target + noise
-                # predicted noise by saved models
-                enc_cond = encoder(torch.cat([vis, ir], dim=1))
-                pred_noise = unet(noisy, ts, encoder_hidden_states=enc_cond).sample
-                # per-sample L1
-                per_sample = F.l1_loss(pred_noise, noise, reduction="none")
-                # mean over non-batch dims
+                noisy = scheduler.add_noise(lat_target, noise, ts)
+
+                # 条件：自动判断像素/latent；并与 UNet dtype 对齐，减少隐式转换
+                cond_in = build_condition_input(vis, ir).to(device=device, dtype=unet.dtype)
+                enc_cond = encoder(cond_in)
+                pred_noise = unet(noisy.to(dtype=unet.dtype), ts, encoder_hidden_states=enc_cond).sample
+                # per-sample MSE
+                per_sample = F.mse_loss(pred_noise.float(), noise.float(), reduction="none")
                 mean_dims = tuple(range(1, per_sample.dim()))
                 losses = per_sample.mean(dim=mean_dims).detach().cpu().numpy()
         else:
             losses = np.full((vis.shape[0],), np.nan)
 
-        # 打印 summary
+        # 打印 summary 与保存图片
         print(f"Batch {batch_idx} - elapsed {elapsed:.3f}s - metric samples count {B}")
         # 打印 metric averages for the batch
         for m, arr in metric_scores.items():
@@ -251,7 +271,7 @@ def run_and_report(loader, name, max_batches=NUM_SHOW_BATCHES):
 
         # 打印 proxy losses
         for i, l in enumerate(losses):
-            print(f"  sample[{i}] proxy L1 loss: {l:.6f}")
+            print(f"  sample[{i}] proxy MSE loss: {l:.6f}")
 
         # 显示图片：将 fused / label / vis (只展示第一样本)
         vis_uint8 = tensor_to_uint8(vis)

@@ -16,6 +16,7 @@ logs/
 *.pyo
 *.pyd
 __pycache__/
+*.ipynb
 
 # data
 data/
