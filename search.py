@@ -13,7 +13,7 @@ CUR_DIR = os.path.dirname(__file__)
 if CUR_DIR not in sys.path:
     sys.path.append(CUR_DIR)
 
-import method2  # 直接调度 method2.main，通过覆盖其全局变量实现扫参
+import train as train  # 直接调度 method2.main，通过覆盖其全局变量实现扫参
 
 # 共同全局控制（可被命令行或上层脚本覆盖）
 EPOCHS = 4              # 固定每次4 epoch（重点关注 1/2）
@@ -23,7 +23,7 @@ METRIC_MODE = "mu"      # 评测统一使用均值权重，和你在 method2.py 
 DATASET_TRAIN = "MSRS"  # method2 已固定用 MSRS 训练
 
 # 是否跑全量240组。False 则跑快速小网格验证流程
-RUN_FULL = False
+RUN_FULL = True
 
 # 全量搜索范围（约 4×5×3×4 = 240 组）
 # - max_ratio:      [1, 4, 16, 40]
@@ -67,31 +67,31 @@ class EvalHook:
 def set_method2_globals(cfg: Dict[str, Any], exp_dir: str):
     """根据 cfg 覆盖 method2 的全局变量"""
     # 训练与评测控制
-    method2.EPOCHS = cfg.get("epochs", EPOCHS)
-    method2.TEST_FREQ = cfg.get("test_freq", TEST_FREQ)
-    method2.METRIC_MODE = cfg.get("metric_mode", METRIC_MODE)
-    method2.PROJECT_DIR = exp_dir
+    train.EPOCHS = cfg.get("epochs", EPOCHS)
+    train.TEST_FREQ = cfg.get("test_freq", TEST_FREQ)
+    train.METRIC_MODE = cfg.get("metric_mode", METRIC_MODE)
+    train.PROJECT_DIR = exp_dir
     # 关闭保存以加速扫参
-    method2.SAVE_IMAGES_TO_DIR = False
-    method2.SAVE_MODELS = False
-    method2.SAVE_FREQ = 0
+    train.SAVE_IMAGES_TO_DIR = False
+    train.SAVE_MODELS = False
+    train.SAVE_FREQ = 0
     # 覆盖 FusionLoss 权重
-    method2.LOSS_MAX_RATIO = float(cfg["max_ratio"])
-    method2.LOSS_CONSIST_RATIO = float(cfg["consist_ratio"])
-    method2.LOSS_GRAD_RATIO = float(cfg["grad_ratio"])
+    train.LOSS_MAX_RATIO = float(cfg["max_ratio"])
+    train.LOSS_CONSIST_RATIO = float(cfg["consist_ratio"])
+    train.LOSS_GRAD_RATIO = float(cfg["grad_ratio"])
     # ssim_shared 优先（同时赋给 ssim_ratio 与 ssim_ir_ratio），否则回退到独立字段
     if "ssim_shared" in cfg:
         shared = float(cfg["ssim_shared"])
-        method2.LOSS_SSIM_RATIO = shared
-        method2.LOSS_SSIM_IR_RATIO = shared
+        train.LOSS_SSIM_RATIO = shared
+        train.LOSS_SSIM_IR_RATIO = shared
     else:
-        method2.LOSS_SSIM_RATIO = float(cfg["ssim_ratio"])
-        method2.LOSS_SSIM_IR_RATIO = float(cfg["ssim_ir_ratio"])
-    method2.LOSS_IR_COMPOSE = float(FIXED_LOSS_KW["ir_compose"])
-    method2.LOSS_COLOR_RATIO = float(FIXED_LOSS_KW["color_ratio"])
-    method2.LOSS_SSIM_WINDOW = int(FIXED_LOSS_KW["ssim_window_size"])
-    method2.LOSS_MAX_MODE = FIXED_LOSS_KW["max_mode"]
-    method2.LOSS_CONSIST_MODE = FIXED_LOSS_KW["consist_mode"]
+        train.LOSS_SSIM_RATIO = float(cfg["ssim_ratio"])
+        train.LOSS_SSIM_IR_RATIO = float(cfg["ssim_ir_ratio"])
+    train.LOSS_IR_COMPOSE = float(FIXED_LOSS_KW["ir_compose"])
+    train.LOSS_COLOR_RATIO = float(FIXED_LOSS_KW["color_ratio"])
+    train.LOSS_SSIM_WINDOW = int(FIXED_LOSS_KW["ssim_window_size"])
+    train.LOSS_MAX_MODE = FIXED_LOSS_KW["max_mode"]
+    train.LOSS_CONSIST_MODE = FIXED_LOSS_KW["consist_mode"]
 
 def grid_iter(grid: Dict[str, List[Any]]):
     keys = list(grid.keys())
@@ -104,11 +104,11 @@ def run_one_experiment(exp_id: int, cfg: Dict[str, Any], out_root: str):
     set_method2_globals(cfg, exp_dir)
     # 注入回调
     hook = EvalHook()
-    method2.EVAL_CALLBACK = hook
+    train.EVAL_CALLBACK = hook
     # 运行
     print(f"\n==== EXP {exp_id} start ====\nConfig: {cfg}\nDir: {exp_dir}")
     start = time.time()
-    method2.main()
+    train.main()
     elapsed = time.time() - start
     print(f"==== EXP {exp_id} done in {elapsed/60:.2f} min ====")
     return {"cfg": cfg, "history": hook.history, "elapsed_sec": elapsed}
