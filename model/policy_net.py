@@ -86,3 +86,65 @@ class PolicyNet(nn.Module):
         logvar = logits[:, 1:2, :, :]
         
         return mu, logvar
+
+if __name__ == "__main__":
+    import time
+
+    def count_params(m: nn.Module) -> int:
+        return sum(p.numel() for p in m.parameters())
+
+    def to_human(n: float) -> str:
+        if n >= 1e9:
+            return f"{n/1e9:.3f}G"
+        if n >= 1e6:
+            return f"{n/1e6:.3f}M"
+        if n >= 1e3:
+            return f"{n/1e3:.3f}K"
+        return str(int(n))
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = PolicyNet().to(device).eval()
+
+    # 随机输入（假设 VIS 为3通道，IR为1通道；分辨率可按需修改）
+    N, H, W = 16, 480, 640
+    vis = torch.randn(N, 3, H, W, device=device)
+    ir = torch.randn(N, 1, H, W, device=device)
+
+    # 前向测试
+    with torch.no_grad():
+        if device == "cuda":
+            torch.cuda.synchronize()
+        t0 = time.time()
+        mu, logvar = model(vis, ir)
+        if device == "cuda":
+            torch.cuda.synchronize()
+        dt_ms = (time.time() - t0) * 1000.0
+
+    # 参数量
+    params = count_params(model)
+
+    # 计算FLOPs（优先使用 fvcore，其次 thop；缺失则提示）
+    flops_total = None
+    backend = None
+    try:
+        from fvcore.nn import FlopCountAnalysis
+        flops_total = FlopCountAnalysis(model, (vis, ir)).total()
+        backend = "fvcore(FLOPs)"
+    except Exception:
+        try:
+            from thop import profile
+            macs, _ = profile(model, inputs=(vis, ir), verbose=False)
+            flops_total = macs  # THOP 返回 MACs，通常作为 FLOPs 近似值使用
+            backend = "thop(MACs)"
+        except Exception:
+            backend = "none"
+
+    print(f"Device: {device}")
+    print(f"Input: VIS {tuple(vis.shape)}, IR {tuple(ir.shape)}")
+    print(f"Output: mu {tuple(mu.shape)}, logvar {tuple(logvar.shape)}")
+    print(f"Params: {params} ({to_human(params)} params)")
+    if flops_total is not None:
+        print(f"FLOPs[{backend}]: {flops_total:.0f} ({to_human(flops_total)} ops)")
+    else:
+        print("FLOPs: 未安装 fvcore/thop，无法计算。可安装：pip install fvcore thop")
+    print(f"Forward time: {dt_ms:.2f} ms")
