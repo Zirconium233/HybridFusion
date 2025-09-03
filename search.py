@@ -6,19 +6,19 @@ from typing import Dict, Any, List
 
 import torch
 import pandas as pd
-
+import numpy as np
 # 将当前目录加入 import 路径（VS Code 运行在 Image/ 下时可忽略）
 import sys
 CUR_DIR = os.path.dirname(__file__)
 if CUR_DIR not in sys.path:
     sys.path.append(CUR_DIR)
 
-import train as train  # 直接调度 method2.main，通过覆盖其全局变量实现扫参
+import train_ycbcr as train  # 直接调度 method2.main，通过覆盖其全局变量实现扫参
 
 # 共同全局控制（可被命令行或上层脚本覆盖）
 EPOCHS = 4              # 固定每次4 epoch（重点关注 1/2）
 TEST_FREQ = 1           # 每个epoch评测一次，便于抓取1/2
-PROJECT_ROOT = "./checkpoints/search_method2"
+PROJECT_ROOT = "./checkpoints/search"
 METRIC_MODE = "mu"      # 评测统一使用均值权重，和你在 method2.py 的对齐
 DATASET_TRAIN = "MSRS"  # method2 已固定用 MSRS 训练
 
@@ -32,10 +32,13 @@ RUN_FULL = True
 # - consist_ratio:  [1, 12, 24, 40]
 # 其余保持默认：ir_compose=2.0, color_ratio=2.0, window=48, max_mode="l1", consist_mode="l1"
 FULL_GRID = {
-    "max_ratio":     [1.0, 4.0, 16.0, 40.0],
+    # 将部分默认值稍微上调以贴合 train_ycbcr 的强 loss 配置
+    "max_ratio":     [10.0, 4.0, 16.0, 40.0],
     "grad_ratio":    [2.0, 32.0, 40.0, 64.0, 90.0],
-    "ssim_shared":   [2.0, 10.0, 32.0],
-    "consist_ratio": [1.0, 12.0, 24.0, 40.0],
+    # 使用 train_ycbcr 中较低的 ssim 初始值（1.0）
+    "ssim_shared":   [1.0, 10.0, 32.0],
+    # 将最小的一项从 1.0 调整为 2.0（更接近你建议的保守值）
+    "consist_ratio": [2.0, 12.0, 24.0, 40.0],
 }
 
 # 快速小范围验证（约 2×2×1×2 = 4 组）
@@ -123,6 +126,17 @@ def history_to_dataframe(exp_id: int, history: List[Dict[str, Any]]):
             rows.append(row)
     return pd.DataFrame(rows)
 
+# 新增：评估时的数据集权重（MSRS 70%，其余 5 个平分 30%）
+DATASET_WEIGHTS = {
+    "MSRS": 0.70,
+    "M3FD": 0.06,
+    "RS":   0.06,
+    "PET":  0.06,
+    "SPECT":0.06,
+    "CT":   0.06,
+}
+DATASET_LIST = list(DATASET_WEIGHTS.keys())
+
 def summarize_topk(df_all: pd.DataFrame, params_table: pd.DataFrame, epoch_target: int, topk: int = 10):
     df_e = df_all[df_all["epoch"] == epoch_target].copy()
     if df_e.empty:
@@ -130,9 +144,20 @@ def summarize_topk(df_all: pd.DataFrame, params_table: pd.DataFrame, epoch_targe
     # 只用 Reward 排序；同时保留各数据集的主要指标（VIF/Qabf/SSIM/Reward）
     piv = df_e.pivot_table(index="exp_id", columns="dataset",
                            values=["Reward", "VIF", "Qabf", "SSIM"], aggfunc="mean")
-    # 平均 Reward 作为排名依据
-    reward_cols = [c for c in piv.columns if isinstance(c, tuple) and c[0] == "Reward"]
-    piv[("Reward", "MeanOverSets")] = piv[reward_cols].mean(axis=1)
+    # 加权平均 Reward 作为排名依据（按 DATASET_WEIGHTS；若某实验缺失某集合，则按剩余权重重归一）
+    # 构造每行的加权平均
+    def weighted_reward_row(row):
+        total = 0.0
+        wsum = 0.0
+        for ds in DATASET_LIST:
+            key = ("Reward", ds)
+            if key in row.index and not np.isnan(row[key]):
+                w = DATASET_WEIGHTS.get(ds, 0.0)
+                total += float(row[key]) * w
+                wsum += w
+        return (total / wsum) if (wsum > 0) else np.nan
+
+    piv[("Reward", "MeanOverSets")] = piv.apply(weighted_reward_row, axis=1)
     piv = piv.sort_values(by=("Reward", "MeanOverSets"), ascending=False)
     # 展平列名
     piv.columns = [f"{a}_{b}" if b != "" else f"{a}" for a, b in piv.columns]

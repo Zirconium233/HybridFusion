@@ -15,17 +15,14 @@ from model.traditional_fusion import LaplacianPyramidFusion
 from metric.MetricGPU import VIF_function_batch, Qabf_function_batch, SSIM_function_batch
 
 # -------------------------------
-# 超参数配置
+# 超参数配置（与 train.py 基本一致）
 # -------------------------------
-EPOCHS: int = 10
+EPOCHS: int = 500
 LR: float = 1e-4
-# KL 散度权重：鼓励策略网络在自监督阶段保留一定随机性
 KL_WEIGHT: float = 1e-5
-# 融合自监督损失缩放（便于将KLD控制在合适量级）
 LOSS_SCALE_FACTOR: float = 0.1
-# 混合精度
 MIXED_PRECISION: str = "bf16"  # "no" | "fp16" | "bf16"
-PROJECT_DIR: str = "./checkpoints/stochastic_policy_stage1_final"
+PROJECT_DIR: str = "./checkpoints/stochastic_policy_ycbcr_final"
 SAVE_IMAGES_TO_DIR: bool = True
 TRAIN_BATCH_SIZE: int = 16
 TEST_BATCH_SIZE: int = 2
@@ -33,14 +30,12 @@ NUM_WORKERS: int = 4
 GRAD_ACCUM_STEPS: int = 2
 MAX_GRAD_NORM: float = 1.0
 TEST_FREQ: int = 1
-SAVE_FREQ: int = 1
+SAVE_FREQ: int = 50
 METRIC_MODE: str = 'mu' # mu or sample
-# 是否保存模型权重（供扫参时快速关闭）
 SAVE_MODELS: bool = True
-# 评测时的外部回调（search.py 会注入），形式：fn(epoch:int, results:Dict[str,Dict[str,float]])
 EVAL_CALLBACK = None
 
-# FusionLoss 可调权重（默认与你提供的一致；search.py 会覆盖）
+# FusionLoss 权重
 LOSS_MAX_RATIO: float = 10.0
 LOSS_CONSIST_RATIO: float = 2.0
 LOSS_GRAD_RATIO: float = 40.0
@@ -53,117 +48,89 @@ LOSS_CONSIST_MODE: str = "l1"
 LOSS_SSIM_WINDOW: int = 48
 
 # -------------------------------
-# 数据集路径（默认 MSRS，与 pretrain_vae.py 对齐）
+# 数据集路径（与 train.py 对齐）
 # -------------------------------
 DATASETS: Dict[str, Dict[str, Dict[str, str]]] = {
     "MSRS": {
-        "train": {
-            "dir_A": "./data/MSRS-main/MSRS-main/train/vi",
-            "dir_B": "./data/MSRS-main/MSRS-main/train/ir",
-            # C 可选，这里不需要监督标签
-        },
-        "test": {
-            "dir_A": "./data/MSRS-main/MSRS-main/test/vi",
-            "dir_B": "./data/MSRS-main/MSRS-main/test/ir",
-        },
+        "train": {"dir_A": "./data/MSRS-main/MSRS-main/train/vi",
+                  "dir_B": "./data/MSRS-main/MSRS-main/train/ir"},
+        "test":  {"dir_A": "./data/MSRS-main/MSRS-main/test/vi",
+                  "dir_B": "./data/MSRS-main/MSRS-main/test/ir"},
     },
     "M3FD": {
-        "train": {
-            "dir_A": "", # not used
-            "dir_B": "",
-        },
-        "test": {
-            "dir_A": "./data/M3FD_Fusion/Vis",
-            "dir_B": "./data/M3FD_Fusion/Ir",
-        },
+        "train": {"dir_A": "", "dir_B": ""},
+        "test":  {"dir_A": "./data/M3FD_Fusion/Vis",
+                  "dir_B": "./data/M3FD_Fusion/Ir"},
     },
     "RS": {
-        "train": { # not used
-            "dir_A": "",
-            "dir_B": "",
-        },
-        "test": {
-            "dir_A": "./data/road-scene-infrared-visible-images-master/road-scene-infrared-visible-images-master/crop_LR_visible",
-            "dir_B": "./data/road-scene-infrared-visible-images-master/road-scene-infrared-visible-images-master/cropinfrared",
-        },
+        "train": {"dir_A": "", "dir_B": ""},
+        "test":  {"dir_A": "./data/road-scene-infrared-visible-images-master/road-scene-infrared-visible-images-master/crop_LR_visible",
+                  "dir_B": "./data/road-scene-infrared-visible-images-master/road-scene-infrared-visible-images-master/cropinfrared"},
     },
     "PET": {
-        "train": {
-            "dir_A": "",
-            "dir_B": "",
-        },
-        "test": {
-            "dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/PET-MRI/PET",
-            "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/PET-MRI/MRI",
-        },
+        "train": {"dir_A": "", "dir_B": ""},
+        "test":  {"dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/PET-MRI/PET",
+                  "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/PET-MRI/MRI"},
     },
     "CT": {
-        "train": { # channel mismatch
-            "dir_A": "",
-            "dir_B": "",
-        },
-        "test": {
-            "dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/CT-MRI/CT",
-            "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/CT-MRI/MRI",
-        },
+        "train": {"dir_A": "", "dir_B": ""},
+        "test":  {"dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/CT-MRI/CT",
+                  "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/CT-MRI/MRI"},
     },
     "SPECT": {
-        "train": {
-            "dir_A": ".",
-            "dir_B": ".",
-        },
-        "test": {
-            "dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/SPECT-MRI/SPECT",
-            "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/SPECT-MRI/MRI",
-        },
+        "train": {"dir_A": ".", "dir_B": "."},
+        "test":  {"dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/SPECT-MRI/SPECT",
+                  "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/SPECT-MRI/MRI"},
     }
 }
-TEST_SET_NAMES = ["MSRS","M3FD", "RS", "PET", "SPECT"]
+TEST_SET_NAMES = ["MSRS","M3FD", "RS", "PET", "SPECT", "CT"]
 
 torch.backends.cudnn.benchmark = False
 
 
 # -------------------------------
-# 工具函数（与 pretrain_vae.py 一致风格）
+# 工具函数
 # -------------------------------
 def to_ch_last(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous(memory_format=torch.channels_last)
 
-
 def to_01(x: torch.Tensor) -> torch.Tensor:
-    # 输入范围 [-1,1] -> [0,1]
     return (x.clamp(-1, 1) + 1.0) * 0.5
 
+def to_m11(x: torch.Tensor) -> torch.Tensor:
+    return x.clamp(0, 1) * 2.0 - 1.0
 
 def to_255(x: torch.Tensor) -> torch.Tensor:
-    # 输入范围 [-1,1] -> [0,255]
     return (x.clamp(-1, 1) + 1.0) * 127.5
 
-
 def save_image_grid(path: str, img: torch.Tensor, nrow: int = 4):
-    """
-    保存 B,C,H,W 张量到 path，范围[-1,1]；使用 torchvision.utils.save_image 生成网格。
-    """
     x = img.detach().to(torch.float32).cpu().clamp(-1, 1)
     save_image(x, path, nrow=min(nrow, x.size(0)), normalize=True, value_range=(-1, 1), padding=2)
 
-
-def log_images_tb(accelerator: Accelerator, tag: str, images: torch.Tensor, step: int):
+def rgb_to_ycbcr(x_rgb_m11: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    将 [-1,1] 的 B,C,H,W 图像写入 TensorBoard（0..1）。
+    x_rgb_m11: [-1,1] RGB -> 返回 (Y, Cb, Cr), 皆为 [-1,1]
+    使用 BT.601 全范围，先映射到 [0,1] 再计算
     """
-    if not accelerator.is_main_process or len(accelerator.trackers) == 0:
-        return
-    writer = None
-    for t in accelerator.trackers:
-        if getattr(t, "name", "") == "tensorboard":
-            writer = getattr(t, "writer", None)
-            break
-    if writer is None:
-        return
-    imgs = to_01(images.detach().to(torch.float32).cpu())
-    writer.add_images(tag, imgs, global_step=step)
+    x = to_01(x_rgb_m11)
+    r, g, b = x[:, 0:1], x[:, 1:1+1], x[:, 2:2+1]
+    y  = 0.299 * r + 0.587 * g + 0.114 * b
+    cb = -0.168736 * r - 0.331264 * g + 0.5 * b + 0.5
+    cr = 0.5 * r - 0.418688 * g - 0.081312 * b + 0.5
+    return to_m11(y), to_m11(cb), to_m11(cr)
 
+def ycbcr_to_rgb(y_m11: torch.Tensor, cb_m11: torch.Tensor, cr_m11: torch.Tensor) -> torch.Tensor:
+    """
+    输入 Y/Cb/Cr 为 [-1,1]，返回 RGB[-1,1]
+    """
+    y  = to_01(y_m11)
+    cb = to_01(cb_m11) - 0.5
+    cr = to_01(cr_m11) - 0.5
+    r = y + 1.402 * cr
+    g = y - 0.344136 * cb - 0.714136 * cr
+    b = y + 1.772 * cb
+    rgb = torch.cat([r, g, b], dim=1).clamp(0, 1)
+    return to_m11(rgb)
 
 def build_dataloaders(accelerator: Accelerator):
     train_paths = DATASETS["MSRS"]["train"]
@@ -205,7 +172,7 @@ def build_dataloaders(accelerator: Accelerator):
 
 
 # -------------------------------
-# 训练主流程
+# 训练主流程（融合仅作用在 Y 通道）
 # -------------------------------
 def main():
     accelerator = Accelerator(
@@ -214,7 +181,7 @@ def main():
         mixed_precision=MIXED_PRECISION,
         gradient_accumulation_steps=GRAD_ACCUM_STEPS,
     )
-    accelerator.init_trackers("stochastic_policy_stage1")
+    accelerator.init_trackers("stochastic_policy_ycbcr")
 
     if accelerator.is_main_process:
         os.makedirs(PROJECT_DIR, exist_ok=True)
@@ -224,11 +191,9 @@ def main():
     # 数据
     train_loader, test_loaders = build_dataloaders(accelerator)
 
-    # 1) 策略网络（可训练）
-    policy_net = PolicyNet(in_channels=4, out_channels=2)
-    # 2) 固定的拉普拉斯金字塔融合核（不可训练）
+    # 策略网络：仅接收 2 通道输入（A_Y 和 B_IR）
+    policy_net = PolicyNet(in_channels=2, out_channels=2)
     fusion_kernel = LaplacianPyramidFusion(num_levels=4)
-    # 3) 自监督融合损失（使用全局可调权重）
     fusion_loss_fn = FusionLoss(
         max_ratio=LOSS_MAX_RATIO,
         consist_ratio=LOSS_CONSIST_RATIO,
@@ -244,20 +209,15 @@ def main():
 
     optimizer = torch.optim.AdamW(policy_net.parameters(), lr=LR, weight_decay=1e-4)
 
-    # 加速准备：仅将可训练模块和训练 dataloader 交给 accelerate
     policy_net, optimizer, train_loader = accelerator.prepare(policy_net, optimizer, train_loader)
-
-    # 模型参数 dtype（bf16/fp16/fp32），使输入与之对齐
     model_dtype = next(accelerator.unwrap_model(policy_net).parameters()).dtype
 
-    # 无参数模块放到正确 device/dtype
     fusion_kernel = fusion_kernel.to(device=accelerator.device, dtype=model_dtype)
     fusion_loss_fn = fusion_loss_fn.to(device=accelerator.device, dtype=model_dtype)
 
     global_step = 0
     for epoch in range(1, EPOCHS + 1):
         policy_net.train()
-        # 统计（epoch 级别）
         epoch_total_loss_sum = 0.0
         epoch_fusion_loss_sum = 0.0
         epoch_kld_sum = 0.0
@@ -265,40 +225,50 @@ def main():
 
         pbar = tqdm(train_loader, disable=not accelerator.is_main_process, desc=f"Epoch {epoch}/{EPOCHS}")
         for batch in pbar:
-            # 兼容数据集返回 (A,B) 或 (A,B,C)
-            if isinstance(batch, (list, tuple)):
-                if len(batch) >= 2:
-                    A, B = batch[0], batch[1]
-                else:
-                    raise RuntimeError("Train batch should provide (A,B[,C]).")
-            else:
-                raise RuntimeError("Dataset should return a tuple/list (A,B[,C]).")
+            if not (isinstance(batch, (list, tuple)) and len(batch) >= 2):
+                raise RuntimeError("Train batch should provide (A,B[,C]).")
+            A_rgb, B_ir = batch[0], batch[1]
 
-            # 入模前对齐 device/dtype，并保持 channels_last
-            A = to_ch_last(A.to(device=accelerator.device, dtype=model_dtype))
-            B = to_ch_last(B.to(device=accelerator.device, dtype=model_dtype))
+            # 对齐 device/dtype 并保持 channels_last
+            A_rgb = to_ch_last(A_rgb.to(device=accelerator.device, dtype=model_dtype))
+            B_ir = to_ch_last(B_ir.to(device=accelerator.device, dtype=model_dtype))  # 1 通道
+
+            # 处理 A 的通道：如果是 3 通道则转换到 YCbCr（训练时 PET/SPECT），
+            # 如果是单通道（CT），直接当作 Y（不做 Cb/Cr）
+            if A_rgb.shape[1] == 3:
+                Y, Cb, Cr = rgb_to_ycbcr(A_rgb)
+            else:
+                # 保证为 1 通道
+                Y = A_rgb if A_rgb.shape[1] == 1 else A_rgb.mean(dim=1, keepdim=True)
+                Cb = Cr = None
+
+            B1 = B_ir if B_ir.shape[1] == 1 else B_ir.mean(dim=1, keepdim=True)
 
             with accelerator.accumulate(policy_net):
-                # 1) 策略网络输出分布参数（均值/对数方差）
-                mu, logvar = policy_net(A, B)  # mu in (0,1), logvar unrestricted
-
-                # 2) 采样权重图（重参数化），并裁剪到 [0,1]
+                # 策略网络（2通道：Y 与 B）
+                mu, logvar = policy_net(Y, B1)
                 std = torch.exp(0.5 * logvar)
-                eps = torch.randn_like(std)
-                # sampled_w = torch.clamp(mu + eps * std, 0.0, 1.0)
 
-                # 3) 固定融合核执行融合
-                #    注意：融合核期望 B 是单通道（若 B 为单通道，这里直接传）
-                # F_hat = fusion_kernel(A, B, sampled_w)
-                F_hat = fusion_kernel(A, B, mu)
+                # 融合仅在 Y 通道
+                F_Y = fusion_kernel(Y, B1, mu)
+                # 颜色由 A 直接提供：复原到 RGB
+                if Cb is not None:
+                    F_rgb = ycbcr_to_rgb(F_Y, Cb, Cr)
+                else:
+                    # CT / 单通道：把 fused Y 扩为 3 通道用于损失计算（直接灰度复用）
+                    F_rgb = F_Y.repeat(1, 3, 1, 1)
 
-                # 4) 融合自监督损失（需要三者通道一致；将 IR 扩 3 通道）
-                B_for_loss = B if B.shape[1] == 3 else B.repeat(1, 3, 1, 1)
-                fusion_loss = fusion_loss_fn(A, B_for_loss, F_hat)
+                # 损失：A_rgb vs (IR 扩 3 通道) vs F_rgb
+                B_for_loss = B1.repeat(1, 3, 1, 1)
+                # A_rgb 可能是单通道或三通道；统一到三通道用于 loss
+                if A_rgb.shape[1] == 3:
+                    A_for_loss = A_rgb
+                else:
+                    A_for_loss = Y.repeat(1, 3, 1, 1)
+                fusion_loss = fusion_loss_fn(A_for_loss, B_for_loss, F_rgb)
 
-                # 5) KL 正则（权重图分布 ~ N(0, I)）
+                # KL 正则
                 kld_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
-
                 total_loss = fusion_loss * LOSS_SCALE_FACTOR + KL_WEIGHT * kld_loss
 
                 accelerator.backward(total_loss)
@@ -306,7 +276,7 @@ def main():
                 optimizer.step()
                 optimizer.zero_grad()
 
-            bsz = A.shape[0]
+            bsz = A_rgb.shape[0]
             epoch_total_loss_sum += float(total_loss.item()) * bsz
             epoch_fusion_loss_sum += float(fusion_loss.item()) * bsz
             epoch_kld_sum += float(kld_loss.item()) * bsz
@@ -328,13 +298,13 @@ def main():
                     step=global_step,
                 )
 
-        # 跨进程聚合 epoch 级统计
+        # 聚合并打印
         stats_local = torch.tensor(
             [epoch_total_loss_sum, epoch_fusion_loss_sum, epoch_kld_sum, epoch_sample_count],
             device=accelerator.device,
             dtype=torch.float64,
         )
-        stats_all = accelerator.gather_for_metrics(stats_local)  # [world, 4]
+        stats_all = accelerator.gather_for_metrics(stats_local)
         if stats_all.ndim == 1:
             stats_all = stats_all.unsqueeze(0)
         totals = stats_all.sum(dim=0)
@@ -375,7 +345,7 @@ def main():
 
 
 # -------------------------------
-# 评估与日志
+# 评估与日志（融合仅作用在 Y，输出 F_rgb）
 # -------------------------------
 @torch.no_grad()
 def evaluate_and_log(
@@ -384,13 +354,12 @@ def evaluate_and_log(
     fusion_kernel: LaplacianPyramidFusion,
     test_loaders: Dict[str, DataLoader],
     epoch: int,
-    metric_mode: str = 'mu', # mu or sample
+    metric_mode: str = 'mu',
 ):
     policy_net.eval()
     device = accelerator.device
     model_dtype = next(accelerator.unwrap_model(policy_net).parameters()).dtype
 
-    # 引入更多指标
     from metric.MetricGPU import (
         PSNR_function_batch, MSE_function_batch, CC_function_batch, SCD_function_batch,
         Nabf_function_batch, MI_function_batch, EN_function_batch, SF_function_batch,
@@ -402,59 +371,59 @@ def evaluate_and_log(
         if accelerator.is_main_process:
             print(f"\n[Eval] Epoch {epoch} - {set_name}")
 
-        all_vif_cpu = []
-        all_qbf_cpu = []
-        all_ssim_cpu = []
+        all_vif_cpu = []; all_qbf_cpu = []; all_ssim_cpu = []
         all_psnr_cpu, all_mse_cpu, all_cc_cpu, all_scd_cpu = [], [], [], []
         all_nabf_cpu, all_mi_cpu = [], []
         all_ag_cpu, all_en_cpu, all_sf_cpu, all_sd_cpu = [], [], [], []
 
         for batch_idx, batch in enumerate(loader):
-            if isinstance(batch, (list, tuple)):
-                if len(batch) >= 2:
-                    A, B = batch[0], batch[1]
-                else:
-                    raise RuntimeError("Test batch should provide (A,B[,C]).")
+            if not (isinstance(batch, (list, tuple)) and len(batch) >= 2):
+                raise RuntimeError("Test batch should provide (A,B[,C]).")
+            A_rgb, B_ir = batch[0], batch[1]
+
+            A_rgb = to_ch_last(A_rgb.to(device=device, dtype=model_dtype))
+            B_ir = to_ch_last(B_ir.to(device=device, dtype=model_dtype))
+            # 兼容 CT（单通道）与 RGB（3通道）
+            if A_rgb.shape[1] == 3:
+                Y, Cb, Cr = rgb_to_ycbcr(A_rgb)
+                A_for_metric = A_rgb
             else:
-                raise RuntimeError("Test dataset should return a tuple/list (A,B[,C]).")
+                Y = A_rgb if A_rgb.shape[1] == 1 else A_rgb.mean(dim=1, keepdim=True)
+                Cb = Cr = None
+                # 评测时将 A 扩为 3 通道以计算与 fused 的指标（灰度复用）
+                A_for_metric = Y.repeat(1, 3, 1, 1)
+            B1 = B_ir if B_ir.shape[1] == 1 else B_ir.mean(dim=1, keepdim=True)
 
-            A = to_ch_last(A.to(device=device, dtype=model_dtype))
-            B = to_ch_last(B.to(device=device, dtype=model_dtype))
-
-            # 策略均值图（确定性融合）与一次随机采样（随机融合）
-            mu, logvar = policy_net(A, B)
+            mu, logvar = policy_net(Y, B1)
             std = torch.exp(0.5 * logvar)
-
-            F_hat_mu = fusion_kernel(A, B, mu)
+            F_Y_mu = fusion_kernel(Y, B1, mu)
             sampled_w = torch.clamp(mu + torch.randn_like(std) * std, 0.0, 1.0)
-            F_hat_sampled = fusion_kernel(A, B, sampled_w)
+            F_Y_sampled = fusion_kernel(Y, B1, sampled_w)
+
+            if Cb is not None:
+                F_hat_mu = ycbcr_to_rgb(F_Y_mu, Cb, Cr)
+                F_hat_sampled = ycbcr_to_rgb(F_Y_sampled, Cb, Cr)
+            else:
+                F_hat_mu = F_Y_mu.repeat(1, 3, 1, 1)
+                F_hat_sampled = F_Y_sampled.repeat(1, 3, 1, 1)
 
             # 仅第一个 batch 记录图像
             if batch_idx == 0:
-                tag = f"images/{set_name}"
-                log_images_tb(accelerator, f"{tag}/A_vis", A, step=epoch)
-                log_images_tb(accelerator, f"{tag}/B_ir", B, step=epoch)
-                log_images_tb(accelerator, f"{tag}/Control_mu", mu, step=epoch)
-                log_images_tb(accelerator, f"{tag}/Control_std", std, step=epoch)
-                log_images_tb(accelerator, f"{tag}/Fused_deterministic", F_hat_mu, step=epoch)
-                log_images_tb(accelerator, f"{tag}/Fused_stochastic", F_hat_sampled, step=epoch)
-
+                def to01(t): return to_01(t.detach().to(torch.float32).cpu())
                 if accelerator.is_main_process and SAVE_IMAGES_TO_DIR:
                     out_dir = os.path.join(PROJECT_DIR, "images", f"epoch_{epoch}", set_name)
                     os.makedirs(out_dir, exist_ok=True)
-                    save_image_grid(os.path.join(out_dir, f"A_e{epoch:04d}.png"), A)
-                    save_image_grid(os.path.join(out_dir, f"B_e{epoch:04d}.png"), B)
-                    save_image_grid(os.path.join(out_dir, f"mu_e{epoch:04d}.png"), mu)
-                    save_image_grid(os.path.join(out_dir, f"F_mu_e{epoch:04d}.png"), F_hat_mu)
-                    save_image_grid(os.path.join(out_dir, f"F_sample_e{epoch:04d}.png"), F_hat_sampled)
+                    # 保存用于可视化的 A（若为 CT，会是灰度3通道副本）
+                    save_image(to01(A_for_metric), os.path.join(out_dir, f"A_rgb_e{epoch:04d}.png"))
+                    save_image(to01(B1.repeat(1,3,1,1)), os.path.join(out_dir, f"B_ir_e{epoch:04d}.png"))
+                    save_image(to01(mu), os.path.join(out_dir, f"mu_e{epoch:04d}.png"))
+                    save_image(to01(F_hat_mu), os.path.join(out_dir, f"F_mu_e{epoch:04d}.png"))
+                    save_image(to01(F_hat_sampled), os.path.join(out_dir, f"F_sample_e{epoch:04d}.png"))
 
-            # 指标（根据 metric_mode 选择）
-            A_255 = to_255(A).to(torch.float32)
-            B_255 = to_255(B).to(torch.float32)
-            if metric_mode == 'mu':
-                F_use = F_hat_mu
-            else:
-                F_use = F_hat_sampled
+            # 指标
+            A_255 = to_255(A_for_metric).to(torch.float32)
+            B_255 = to_255(B1).to(torch.float32)
+            F_use = F_hat_mu if metric_mode == 'mu' else F_hat_sampled
             F_255 = to_255(F_use).to(torch.float32)
 
             try:
@@ -467,11 +436,11 @@ def evaluate_and_log(
                 scd = SCD_function_batch(A_255, B_255, F_255)
                 nabf = Nabf_function_batch(A_255, B_255, F_255)
                 mi = MI_function_batch(A_255, B_255, F_255)
-                # 单图指标针对 fused
                 ag = AG_function_batch(F_255)
                 en = EN_function_batch(F_255)
                 sf = SF_function_batch(F_255)
                 sd = SD_function_batch(F_255)
+
                 # 聚合各进程
                 vif_all = accelerator.gather_for_metrics(vif.reshape(-1)).float().cpu()
                 qbf_all = accelerator.gather_for_metrics(qbf.reshape(-1)).float().cpu()
@@ -486,6 +455,7 @@ def evaluate_and_log(
                 en_all = accelerator.gather_for_metrics(en.reshape(-1)).float().cpu()
                 sf_all = accelerator.gather_for_metrics(sf.reshape(-1)).float().cpu()
                 sd_all = accelerator.gather_for_metrics(sd.reshape(-1)).float().cpu()
+
                 all_vif_cpu.append(vif_all); all_qbf_cpu.append(qbf_all); all_ssim_cpu.append(ssim_all)
                 all_psnr_cpu.append(psnr_all); all_mse_cpu.append(mse_all); all_cc_cpu.append(cc_all); all_scd_cpu.append(scd_all)
                 all_nabf_cpu.append(nabf_all); all_mi_cpu.append(mi_all)
@@ -537,14 +507,12 @@ def evaluate_and_log(
                     },
                     step=epoch,
                 )
-            # 收集到结果字典
             results_all_sets[set_name] = {
                 "Reward": reward_mean, "VIF": vif_mean, "Qabf": qbf_mean, "SSIM": ssim_mean,
                 "PSNR": psnr_mean, "MSE": mse_mean, "CC": cc_mean, "SCD": scd_mean,
                 "Nabf": nabf_mean, "MI": mi_mean, "AG": ag_mean, "EN": en_mean, "SF": sf_mean, "SD": sd_mean,
             }
 
-    # 执行外部回调（供 search.py 抓取所有指标）
     if callable(EVAL_CALLBACK):
         try:
             EVAL_CALLBACK(epoch, results_all_sets)
