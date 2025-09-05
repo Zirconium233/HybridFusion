@@ -52,38 +52,39 @@ LOSS_SSIM_WINDOW: int = 48
 # -------------------------------
 DATASETS: Dict[str, Dict[str, Dict[str, str]]] = {
     "MSRS": {
-        "train": {"dir_A": "./data/MSRS-main/MSRS-main/train/vi",
-                  "dir_B": "./data/MSRS-main/MSRS-main/train/ir"},
-        "test":  {"dir_A": "./data/MSRS-main/MSRS-main/test/vi",
-                  "dir_B": "./data/MSRS-main/MSRS-main/test/ir"},
+        "train": {"dir_A": "./data/MSRS/train/vi",
+                  "dir_B": "./data/MSRS/train/ir"},
+        "test":  {"dir_A": "./data/MSRS/test/vi",
+                  "dir_B": "./data/MSRS/test/ir"},
     },
-    "M3FD": {
-        "train": {"dir_A": "", "dir_B": ""},
-        "test":  {"dir_A": "./data/M3FD_Fusion/Vis",
-                  "dir_B": "./data/M3FD_Fusion/Ir"},
-    },
-    "RS": {
-        "train": {"dir_A": "", "dir_B": ""},
-        "test":  {"dir_A": "./data/road-scene-infrared-visible-images-master/road-scene-infrared-visible-images-master/crop_LR_visible",
-                  "dir_B": "./data/road-scene-infrared-visible-images-master/road-scene-infrared-visible-images-master/cropinfrared"},
-    },
-    "PET": {
-        "train": {"dir_A": "", "dir_B": ""},
-        "test":  {"dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/PET-MRI/PET",
-                  "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/PET-MRI/MRI"},
-    },
-    "CT": {
-        "train": {"dir_A": "", "dir_B": ""},
-        "test":  {"dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/CT-MRI/CT",
-                  "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/CT-MRI/MRI"},
-    },
-    "SPECT": {
-        "train": {"dir_A": ".", "dir_B": "."},
-        "test":  {"dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/SPECT-MRI/SPECT",
-                  "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/SPECT-MRI/MRI"},
-    }
+    # "M3FD": {
+    #     "train": {"dir_A": "", "dir_B": ""},
+    #     "test":  {"dir_A": "./data/M3FD_Fusion/Vis",
+    #               "dir_B": "./data/M3FD_Fusion/Ir"},
+    # },
+    # "RS": {
+    #     "train": {"dir_A": "", "dir_B": ""},
+    #     "test":  {"dir_A": "./data/road-scene-infrared-visible-images-master/road-scene-infrared-visible-images-master/crop_LR_visible",
+    #               "dir_B": "./data/road-scene-infrared-visible-images-master/road-scene-infrared-visible-images-master/cropinfrared"},
+    # },
+    # "PET": {
+    #     "train": {"dir_A": "", "dir_B": ""},
+    #     "test":  {"dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/PET-MRI/PET",
+    #               "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/PET-MRI/MRI"},
+    # },
+    # "CT": {
+    #     "train": {"dir_A": "", "dir_B": ""},
+    #     "test":  {"dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/CT-MRI/CT",
+    #               "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/CT-MRI/MRI"},
+    # },
+    # "SPECT": {
+    #     "train": {"dir_A": ".", "dir_B": "."},
+    #     "test":  {"dir_A": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/SPECT-MRI/SPECT",
+    #               "dir_B": "./data/Med/Havard-Medical-Image-Fusion-Datasets-main/SPECT-MRI/MRI"},
+    # }
 }
-TEST_SET_NAMES = ["MSRS","M3FD", "RS", "PET", "SPECT", "CT"]
+# TEST_SET_NAMES = ["MSRS","M3FD", "RS", "PET", "SPECT", "CT"]
+TEST_SET_NAMES = ["MSRS"]
 
 torch.backends.cudnn.benchmark = False
 
