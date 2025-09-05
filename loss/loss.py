@@ -5,7 +5,7 @@ from math import exp
 
 
 def cc(img1, img2):
-    # 使 eps 与输入 dtype 对齐，避免混合精度时类型提升
+    
     eps = torch.finfo(img1.dtype).eps
     """Correlation coefficient for (N, C, H, W) tensors in [0.,1.] or arbitrary range."""
     N, C, _, _ = img1.shape
@@ -23,7 +23,7 @@ class L_color(nn.Module):
         super(L_color, self).__init__()
 
     def forward(self, image_visible, image_fused):
-        # 若通道不足3，直接返回0损失，避免YCBCR定义不明导致错误
+        
         if image_visible.shape[1] < 3 or image_fused.shape[1] < 3:
             return torch.tensor(0.0, device=image_visible.device, dtype=image_visible.dtype)
 
@@ -59,13 +59,13 @@ class L_Intensity_Max_RGB(nn.Module):
         super(L_Intensity_Max_RGB, self).__init__()
 
     def forward(self, image_visible, image_infrared, image_fused, max_mode="l1"):
-        # 支持任意通道数，但要求三者通道一致
+        
         assert image_visible.shape[1] == image_infrared.shape[1] == image_fused.shape[1], \
             "image_visible, image_infrared, image_fused 的通道数需一致"
         gray_visible = torch.mean(image_visible, dim=1, keepdim=True)
         gray_infrared = torch.mean(image_infrared, dim=1, keepdim=True)
 
-        # mask 与输入 dtype 对齐，避免混合精度下类型提升
+        
         mask = (gray_infrared > gray_visible).to(dtype=image_visible.dtype)
 
         fused_image = mask * image_infrared + (1 - mask) * image_visible
@@ -89,10 +89,10 @@ class L_Intensity_Consist(nn.Module):
 
 
 class GradientMaxLoss(nn.Module):
-    """边缘/梯度最大保留损失（对x、y方向分别对齐到两者梯度最大值）"""
+    """Edge/Gradient Maximum Preservation Loss (aligning to the maximum gradient of both in the x and y directions respectively)"""
     def __init__(self):
         super(GradientMaxLoss, self).__init__()
-        # 使用register_buffer保证自动跟随到正确设备
+        
         sobel_x = torch.FloatTensor([[-1, 0, 1],
                                      [-2, 0, 2],
                                      [-1, 0, 1]]).view(1, 1, 3, 3)
@@ -113,14 +113,14 @@ class GradientMaxLoss(nn.Module):
 
     def gradient(self, image):
         image = F.pad(image, self.padding, mode='replicate')
-        # 卷积核按输入 dtype 对齐
+        
         gradient_x = F.conv2d(image, self.sobel_x.to(dtype=image.dtype, device=image.device), padding=0)
         gradient_y = F.conv2d(image, self.sobel_y.to(dtype=image.dtype, device=image.device), padding=0)
         return torch.abs(gradient_x), torch.abs(gradient_y)
 
 
 class L_Grad(nn.Module):
-    """可选：合并x/y梯度幅值的梯度损失（未在FusionLoss中默认使用）"""
+    """Optional: Gradient loss that merges x/y gradient magnitudes (not used by default in FusionLoss)"""
     def __init__(self):
         super(L_Grad, self).__init__()
         sobel_x = torch.FloatTensor([[-1, 0, 1],
@@ -145,7 +145,7 @@ class L_Grad(nn.Module):
 
     def gradient(self, image):
         image = F.pad(image, self.padding, mode='replicate')
-        # 卷积核按输入 dtype 对齐
+        
         gradient_x = F.conv2d(image, self.sobel_x.to(dtype=image.dtype, device=image.device), padding=0)
         gradient_y = F.conv2d(image, self.sobel_y.to(dtype=image.dtype, device=image.device), padding=0)
         return torch.abs(gradient_x) + torch.abs(gradient_y)
@@ -160,14 +160,14 @@ class L_Grad(nn.Module):
 
 
 def gaussian(window_size, sigma, *, dtype=torch.float32, device=None):
-    # 新增 dtype/device 以便与输入对齐
+    
     vals = [exp(-(x - window_size // 2) ** 2 / float(2 * sigma ** 2)) for x in range(window_size)]
     gauss = torch.tensor(vals, dtype=dtype, device=device)
     return gauss / gauss.sum()
 
 
 def create_window(window_size, channel=1, *, dtype=torch.float32, device=None):
-    # 新增 dtype/device 以便与输入对齐
+    
     _1D_window = gaussian(window_size, 1.5, dtype=dtype, device=device).unsqueeze(1)
     _2D_window = _1D_window.mm(_1D_window.t()).to(dtype=dtype).unsqueeze(0).unsqueeze(0)
     window = _2D_window.expand(channel, 1, window_size, window_size).contiguous()
@@ -175,7 +175,7 @@ def create_window(window_size, channel=1, *, dtype=torch.float32, device=None):
 
 
 def ssim(img1, img2, window_size=24, window=None, size_average=True, val_range=None):
-    # 支持数据范围自适应
+    
     if val_range is None:
         if torch.max(img1) > 128:
             max_val = 255
@@ -197,10 +197,10 @@ def ssim(img1, img2, window_size=24, window=None, size_average=True, val_range=N
         real_size = min(window_size, height, width)
         window = create_window(real_size, channel=channel, dtype=img1.dtype, device=device)
     else:
-        # 使传入窗口与输入 dtype/device 对齐
+        
         window = window.to(device=img1.device, dtype=img1.dtype)
 
-    # C1/C2 与输入 dtype/device 对齐
+    
     C1 = torch.tensor((0.01 * L) ** 2, dtype=img1.dtype, device=img1.device)
     C2 = torch.tensor((0.03 * L) ** 2, dtype=img1.dtype, device=img1.device)
 
@@ -225,7 +225,7 @@ def ssim(img1, img2, window_size=24, window=None, size_average=True, val_range=N
     else:
         ret = ssim_map.mean(1).mean(1).mean(1)
 
-    # 返回 1 - SSIM 作为loss
+    
     return 1 - ret
 
 
@@ -233,7 +233,7 @@ class L_SSIM(torch.nn.Module):
     def __init__(self, window_size=11):
         super(L_SSIM, self).__init__()
         self.window_size = window_size
-        # 初始以 float32 存储，前向时会cast到输入的 dtype/device
+        
         window = create_window(window_size, dtype=torch.float32, device=None)
         self.register_buffer('window', window)
 
@@ -242,7 +242,7 @@ class L_SSIM(torch.nn.Module):
         (_, channel_2, _, _) = img2.size()
 
         if channel != channel_2 and channel == 1:
-            # 若img1为单通道而img2为多通道，将img1复制到3通道以对齐
+            
             img1 = torch.cat([img1, img1, img1], dim=1)
             channel = 3
 
@@ -250,14 +250,14 @@ class L_SSIM(torch.nn.Module):
             window = self.window.to(device=img1.device, dtype=img1.dtype)
         else:
             window = create_window(self.window_size, channel, dtype=img1.dtype, device=img1.device)
-            # 更新buffer以适配新的通道数（以当前dtype存储）
+            
             self.register_buffer('window', window)
 
         return ssim(img1, img2, window=window, window_size=self.window_size)
 
 
 def structure_loss(img1, img2, window_size=11, window=None, size_average=True, full=False, val_range=None):
-    # 可选结构一致性项（当前未在FusionLoss中使用）
+    
     if val_range is None:
         if torch.max(img1) > 128:
             max_val = 255
@@ -308,21 +308,21 @@ def normalize_grad(gradient_orig):
 
 class FusionLoss(nn.Module):
     """
-    融合损失（无文本/任务依赖，完全批量并行）
-    组成：
-      - SSIM 可见->融合 + 赤外灰度->融合灰度
-      - 强度最大（逐像素从A/B中选择更亮者）
-      - 强度一致性（与可见/赤外灰度一致）
-      - 颜色一致性（Cb/Cr一致）
-      - 梯度最大（基于Sobel的边缘对齐）
-    默认权重来自你提供配置的 default 项：
-      max_ratio=24, consist_ratio=40, grad_ratio(原text_ratio)=48, ssim_ratio=2, color_ratio=12, ir_compose=1
+    Fusion Loss (no text/task dependency, fully batch-parallel)
+    Composition:
+      - SSIM visible->fusion + infrared grayscale->fusion grayscale
+      - Intensity maximum (select the brighter one pixel-wise from A/B)
+      - Intensity consistency (consistent with visible/infrared grayscale)
+      - Color consistency (Cb/Cr consistent)
+      - Gradient maximum (Sobel-based edge alignment)
+    Default weight items:
+      max_ratio=24, consist_ratio=40, grad_ratio(original text_ratio)=48, ssim_ratio=2, color_ratio=12, ir_compose=1
     """
     def __init__(
         self,
         max_ratio: float = 10.0,
         consist_ratio: float = 2.0,
-        grad_ratio: float = 40.0,       # 原实现的 text_ratio（实为texture/gradient项）
+        grad_ratio: float = 40.0,       
         ssim_ir_ratio: float = 1.0,
         ssim_ratio: float = 1.0,
         ir_compose: float = 2.0,
@@ -332,14 +332,14 @@ class FusionLoss(nn.Module):
         ssim_window_size: int = 48
     ):
         super().__init__()
-        # 组件
+        
         self.loss_ssim = L_SSIM(window_size=ssim_window_size)
         self.loss_gradmax = GradientMaxLoss()
         self.loss_max = L_Intensity_Max_RGB()
         self.loss_consist = L_Intensity_Consist()
         self.loss_color = L_color()
 
-        # 权重与配置
+        
         self.max_ratio = float(max_ratio)
         self.consist_ratio = float(consist_ratio)
         self.grad_ratio = float(grad_ratio)
@@ -360,25 +360,25 @@ class FusionLoss(nn.Module):
         return image_gray
 
     def forward(self, image_A: torch.Tensor, image_B: torch.Tensor, image_fused: torch.Tensor) -> torch.Tensor:
-        # 并行批次处理，无显式循环
+        
         image_A_gray = self.rgb2gray(image_A)
         image_B_gray = self.rgb2gray(image_B)
         image_F_gray = self.rgb2gray(image_fused)
 
-        # SSIM (可见RGB vs 融合RGB) + (赤外Gray vs 融合Gray)
+        
         loss_ssim = self.ssim_ratio * (
             self.loss_ssim(image_A, image_fused) +
             self.ssim_ir_ratio * self.loss_ssim(image_B_gray, image_F_gray)
         )
 
-        # 强度最大项（像素级从A/B选最大）与一致性项（灰度）
+        
         loss_max = self.max_ratio * self.loss_max(image_A, image_B, image_fused, self.max_mode)
         loss_consist = self.consist_ratio * self.loss_consist(image_A_gray, image_B_gray, image_F_gray, self.ir_compose, self.consist_mode)
 
-        # 颜色项（仅当可见与融合为3通道时有效，否则为0）
+        
         loss_color = self.color_ratio * self.loss_color(image_A, image_fused)
 
-        # 梯度最大项（基于灰度）
+        
         loss_grad = self.grad_ratio * self.loss_gradmax(image_A_gray, image_B_gray, image_F_gray)
 
         total = loss_ssim + loss_max + loss_consist + loss_color + loss_grad
@@ -386,7 +386,7 @@ class FusionLoss(nn.Module):
 
 
 if __name__ == "__main__":
-    # 简单批量测试：128x128, 640x480, 1024x768
+    
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16
 
@@ -399,7 +399,7 @@ if __name__ == "__main__":
         loss = loss_fn(image_A, image_B, image_F)
         print(f"Batch={n}, C={c}, H={h}, W={w} -> loss={loss.item():.6f}")
 
-    # 设定批量大小和通道数（3通道）
+    
     run_case(n=4, c=3, h=128, w=128)
-    run_case(n=2, c=3, h=480, w=640)     # 640x480
-    run_case(n=2, c=3, h=768, w=1024)    # 1024x768
+    run_case(n=2, c=3, h=480, w=640)     
+    run_case(n=2, c=3, h=768, w=1024)    

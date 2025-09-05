@@ -15,9 +15,9 @@ from model.traditional_fusion import LaplacianPyramidFusion
 from metric.MetricGPU import VIF_function_batch, Qabf_function_batch, SSIM_function_batch
 
 # -------------------------------
-# 超参数配置（与 train.py 基本一致）
+# Hyperparameter Configuration
 # -------------------------------
-EPOCHS: int = 12
+EPOCHS: int = 10
 LR: float = 1e-4
 KL_WEIGHT: float = 1e-5
 LOSS_SCALE_FACTOR: float = 0.1
@@ -35,7 +35,7 @@ METRIC_MODE: str = 'mu' # mu or sample
 SAVE_MODELS: bool = True
 EVAL_CALLBACK = None
 
-# FusionLoss 权重
+# FusionLoss weights
 LOSS_MAX_RATIO: float = 10.0
 LOSS_CONSIST_RATIO: float = 2.0
 LOSS_GRAD_RATIO: float = 40.0
@@ -48,7 +48,7 @@ LOSS_CONSIST_MODE: str = "l1"
 LOSS_SSIM_WINDOW: int = 48
 
 # -------------------------------
-# 数据集路径（与 train.py 对齐）
+# Dataset Paths (aligned with train.py)
 # -------------------------------
 DATASETS: Dict[str, Dict[str, Dict[str, str]]] = {
     "MSRS": {
@@ -89,7 +89,7 @@ torch.backends.cudnn.benchmark = False
 
 
 # -------------------------------
-# 工具函数
+# Utility Functions
 # -------------------------------
 def to_ch_last(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous(memory_format=torch.channels_last)
@@ -109,8 +109,8 @@ def save_image_grid(path: str, img: torch.Tensor, nrow: int = 4):
 
 def rgb_to_ycbcr(x_rgb_m11: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    x_rgb_m11: [-1,1] RGB -> 返回 (Y, Cb, Cr), 皆为 [-1,1]
-    使用 BT.601 全范围，先映射到 [0,1] 再计算
+    x_rgb_m11: [-1,1] RGB -> returns (Y, Cb, Cr), all are [-1,1]
+    Uses full range BT.601, first mapped to [0,1] for calculation
     """
     x = to_01(x_rgb_m11)
     r, g, b = x[:, 0:1], x[:, 1:1+1], x[:, 2:2+1]
@@ -121,7 +121,7 @@ def rgb_to_ycbcr(x_rgb_m11: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, t
 
 def ycbcr_to_rgb(y_m11: torch.Tensor, cb_m11: torch.Tensor, cr_m11: torch.Tensor) -> torch.Tensor:
     """
-    输入 Y/Cb/Cr 为 [-1,1]，返回 RGB[-1,1]
+    Inputs Y/Cb/Cr as [-1,1], returns RGB[-1,1]
     """
     y  = to_01(y_m11)
     cb = to_01(cb_m11) - 0.5
@@ -172,7 +172,7 @@ def build_dataloaders(accelerator: Accelerator):
 
 
 # -------------------------------
-# 训练主流程（融合仅作用在 Y 通道）
+# Main Training Loop (Fusion only on Y channel)
 # -------------------------------
 def main():
     accelerator = Accelerator(
@@ -188,10 +188,10 @@ def main():
         print(f"[Config] epochs={EPOCHS}, lr={LR}, kl_w={KL_WEIGHT}, loss_scale={LOSS_SCALE_FACTOR}, mp={MIXED_PRECISION}")
         print(f"[Dirs] project_dir={PROJECT_DIR}")
 
-    # 数据
+    # Data
     train_loader, test_loaders = build_dataloaders(accelerator)
 
-    # 策略网络：仅接收 2 通道输入（A_Y 和 B_IR）
+    # Policy Network: accepts only 2 channels (A_Y and B_IR)
     policy_net = PolicyNet(in_channels=2, out_channels=2)
     fusion_kernel = LaplacianPyramidFusion(num_levels=4)
     fusion_loss_fn = FusionLoss(
@@ -229,45 +229,45 @@ def main():
                 raise RuntimeError("Train batch should provide (A,B[,C]).")
             A_rgb, B_ir = batch[0], batch[1]
 
-            # 对齐 device/dtype 并保持 channels_last
+            # Align device/dtype and maintain channels_last
             A_rgb = to_ch_last(A_rgb.to(device=accelerator.device, dtype=model_dtype))
-            B_ir = to_ch_last(B_ir.to(device=accelerator.device, dtype=model_dtype))  # 1 通道
+            B_ir = to_ch_last(B_ir.to(device=accelerator.device, dtype=model_dtype))  # 1 channel
 
-            # 处理 A 的通道：如果是 3 通道则转换到 YCbCr（训练时 PET/SPECT），
-            # 如果是单通道（CT），直接当作 Y（不做 Cb/Cr）
+            # Handle A's channels: if 3-channel, convert to YCbCr (for PET/SPECT during training);
+            # if single-channel (CT), treat directly as Y (no Cb/Cr)
             if A_rgb.shape[1] == 3:
                 Y, Cb, Cr = rgb_to_ycbcr(A_rgb)
             else:
-                # 保证为 1 通道
+                # Ensure it's 1-channel
                 Y = A_rgb if A_rgb.shape[1] == 1 else A_rgb.mean(dim=1, keepdim=True)
                 Cb = Cr = None
 
             B1 = B_ir if B_ir.shape[1] == 1 else B_ir.mean(dim=1, keepdim=True)
 
             with accelerator.accumulate(policy_net):
-                # 策略网络（2通道：Y 与 B）
+                # Policy network (2 channels: Y and B)
                 mu, logvar = policy_net(Y, B1)
                 std = torch.exp(0.5 * logvar)
 
-                # 融合仅在 Y 通道
+                # Fusion only on the Y channel
                 F_Y = fusion_kernel(Y, B1, mu)
-                # 颜色由 A 直接提供：复原到 RGB
+                # Color provided directly by A: restore to RGB
                 if Cb is not None:
                     F_rgb = ycbcr_to_rgb(F_Y, Cb, Cr)
                 else:
-                    # CT / 单通道：把 fused Y 扩为 3 通道用于损失计算（直接灰度复用）
+                    # CT / single-channel: expand fused Y to 3 channels for loss calculation (reuse as grayscale)
                     F_rgb = F_Y.repeat(1, 3, 1, 1)
 
-                # 损失：A_rgb vs (IR 扩 3 通道) vs F_rgb
+                # Loss: A_rgb vs (IR expanded to 3 channels) vs F_rgb
                 B_for_loss = B1.repeat(1, 3, 1, 1)
-                # A_rgb 可能是单通道或三通道；统一到三通道用于 loss
+                # A_rgb can be single or three channels; unify to three channels for loss
                 if A_rgb.shape[1] == 3:
                     A_for_loss = A_rgb
                 else:
                     A_for_loss = Y.repeat(1, 3, 1, 1)
                 fusion_loss = fusion_loss_fn(A_for_loss, B_for_loss, F_rgb)
 
-                # KL 正则
+                # KL Regularization
                 kld_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
                 total_loss = fusion_loss * LOSS_SCALE_FACTOR + KL_WEIGHT * kld_loss
 
@@ -298,7 +298,7 @@ def main():
                     step=global_step,
                 )
 
-        # 聚合并打印
+        # Aggregate and print
         stats_local = torch.tensor(
             [epoch_total_loss_sum, epoch_fusion_loss_sum, epoch_kld_sum, epoch_sample_count],
             device=accelerator.device,
@@ -320,11 +320,11 @@ def main():
                 step=epoch,
             )
 
-        # 测试与可视化
+        # Test and visualize
         if epoch % TEST_FREQ == 0 or epoch == EPOCHS:
             evaluate_and_log(accelerator, policy_net, fusion_kernel, test_loaders, epoch, METRIC_MODE)
 
-        # 保存
+        # Save
         if SAVE_MODELS and SAVE_FREQ > 0 and (epoch % SAVE_FREQ == 0) and accelerator.is_main_process:
             save_dir = os.path.join(PROJECT_DIR, f"epoch_{epoch}")
             os.makedirs(save_dir, exist_ok=True)
@@ -332,7 +332,7 @@ def main():
             torch.save(unwrapped.state_dict(), os.path.join(save_dir, "policy_net.pth"))
             print(f"[Save] model -> {save_dir}")
 
-    # 最终保存
+    # Final save
     accelerator.wait_for_everyone()
     if SAVE_MODELS and accelerator.is_main_process:
         final_dir = os.path.join(PROJECT_DIR, "final")
@@ -345,7 +345,7 @@ def main():
 
 
 # -------------------------------
-# 评估与日志（融合仅作用在 Y，输出 F_rgb）
+# Evaluation and Logging (Fusion only on Y, outputs F_rgb)
 # -------------------------------
 @torch.no_grad()
 def evaluate_and_log(
@@ -383,14 +383,14 @@ def evaluate_and_log(
 
             A_rgb = to_ch_last(A_rgb.to(device=device, dtype=model_dtype))
             B_ir = to_ch_last(B_ir.to(device=device, dtype=model_dtype))
-            # 兼容 CT（单通道）与 RGB（3通道）
+            # Compatible with CT (single-channel) and RGB (3-channel)
             if A_rgb.shape[1] == 3:
                 Y, Cb, Cr = rgb_to_ycbcr(A_rgb)
                 A_for_metric = A_rgb
             else:
                 Y = A_rgb if A_rgb.shape[1] == 1 else A_rgb.mean(dim=1, keepdim=True)
                 Cb = Cr = None
-                # 评测时将 A 扩为 3 通道以计算与 fused 的指标（灰度复用）
+                # For evaluation, expand A to 3 channels to calculate metrics with the fused image (grayscale reuse)
                 A_for_metric = Y.repeat(1, 3, 1, 1)
             B1 = B_ir if B_ir.shape[1] == 1 else B_ir.mean(dim=1, keepdim=True)
 
@@ -407,20 +407,20 @@ def evaluate_and_log(
                 F_hat_mu = F_Y_mu.repeat(1, 3, 1, 1)
                 F_hat_sampled = F_Y_sampled.repeat(1, 3, 1, 1)
 
-            # 仅第一个 batch 记录图像
+            # Record images for the first batch only
             if batch_idx == 0:
                 def to01(t): return to_01(t.detach().to(torch.float32).cpu())
                 if accelerator.is_main_process and SAVE_IMAGES_TO_DIR:
                     out_dir = os.path.join(PROJECT_DIR, "images", f"epoch_{epoch}", set_name)
                     os.makedirs(out_dir, exist_ok=True)
-                    # 保存用于可视化的 A（若为 CT，会是灰度3通道副本）
+                    # Save A for visualization (if CT, will be a 3-channel grayscale copy)
                     save_image(to01(A_for_metric), os.path.join(out_dir, f"A_rgb_e{epoch:04d}.png"))
                     save_image(to01(B1.repeat(1,3,1,1)), os.path.join(out_dir, f"B_ir_e{epoch:04d}.png"))
                     save_image(to01(mu), os.path.join(out_dir, f"mu_e{epoch:04d}.png"))
                     save_image(to01(F_hat_mu), os.path.join(out_dir, f"F_mu_e{epoch:04d}.png"))
                     save_image(to01(F_hat_sampled), os.path.join(out_dir, f"F_sample_e{epoch:04d}.png"))
 
-            # 指标
+            # Metrics
             A_255 = to_255(A_for_metric).to(torch.float32)
             B_255 = to_255(B1).to(torch.float32)
             F_use = F_hat_mu if metric_mode == 'mu' else F_hat_sampled
@@ -441,7 +441,7 @@ def evaluate_and_log(
                 sf = SF_function_batch(F_255)
                 sd = SD_function_batch(F_255)
 
-                # 聚合各进程
+                # Aggregate across processes
                 vif_all = accelerator.gather_for_metrics(vif.reshape(-1)).float().cpu()
                 qbf_all = accelerator.gather_for_metrics(qbf.reshape(-1)).float().cpu()
                 ssim_all = accelerator.gather_for_metrics(ssim.reshape(-1)).float().cpu()

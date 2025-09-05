@@ -14,18 +14,18 @@ from metric.MetricGPU import (
     SD_function_batch, AG_function_batch
 )
 
-# -------------------------------
-# 配置
-# -------------------------------
+
+
+
 PROJECT_DIR = "./checkpoints/abl_vis_ir"
 TEST_BATCH_SIZE = 2
 NUM_WORKERS = 4
 SAVE_IMAGES_TO_DIR = True
 
-# 六个数据集
+
 TEST_SET_NAMES = ["MSRS", "M3FD", "RS", "PET", "CT", "SPECT"]
 
-# 路径参考 train.py
+
 DATASETS: Dict[str, Dict[str, Dict[str, str]]] = {
     "MSRS": {
         "train": {
@@ -92,9 +92,9 @@ DATASETS: Dict[str, Dict[str, Dict[str, str]]] = {
 torch.backends.cudnn.benchmark = False
 
 
-# -------------------------------
-# 工具
-# -------------------------------
+
+
+
 def to_ch_last(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous(memory_format=torch.channels_last)
 
@@ -126,11 +126,11 @@ def build_test_loaders():
     return loaders
 
 
-# -------------------------------
-# 评测：两条基线
-# - VisAsFused: 直接用可见光当融合结果（3通道；CT 使用 repeat 的 CT 当 VIS）
-# - IrAsFused:  直接用红外当融合结果（保持其原始通道数，通常为1）
-# -------------------------------
+
+
+
+
+
 @torch.no_grad()
 def evaluate_baseline(name: str, loaders: Dict[str, DataLoader], device: torch.device):
     out_metrics = {}
@@ -153,16 +153,16 @@ def evaluate_baseline(name: str, loaders: Dict[str, DataLoader], device: torch.d
             A = to_ch_last(A)
             B = to_ch_last(B)
 
-            # CT: 将 CT repeat 当 VIS 源（以及 VIS 融合图）
+            
             if set_name == "CT":
                 A_vis = make_3ch(A)
             else:
-                A_vis = A  # 其他数据集保持原样（若已是3通道则保持，若1通道则按原样）
-            # 构造两条基线的 fused
+                A_vis = A  
+            
             if name == "VisAsFused":
-                F_hat = make_3ch(A_vis)  # 确保 3 通道
+                F_hat = make_3ch(A_vis)  
             elif name == "IrAsFused":
-                F_hat = B  # 保持 IR 原通道（通常 1 通道）
+                F_hat = B  
             else:
                 raise ValueError("Unknown baseline name")
 
@@ -171,8 +171,8 @@ def evaluate_baseline(name: str, loaders: Dict[str, DataLoader], device: torch.d
                 save_image_grid(os.path.join(out_root, "images", set_name, f"B_{i:04d}.png"), B)
                 save_image_grid(os.path.join(out_root, "images", set_name, f"F_{i:04d}.png"), F_hat)
 
-            # 准备指标输入（范围 0..255，float32）
-            A_255 = to_255(A_vis).to(torch.float32)  # 使用 A_vis（CT 为 repeat 后的3通道）
+            
+            A_255 = to_255(A_vis).to(torch.float32)  
             B_255 = to_255(B).to(torch.float32)
             F_255 = to_255(F_hat).to(torch.float32)
 
@@ -213,7 +213,7 @@ def evaluate_baseline(name: str, loaders: Dict[str, DataLoader], device: torch.d
               f"SCD={metrics['SCD']:.4f} Nabf={metrics['Nabf']:.4f} MI={metrics['MI']:.4f} | "
               f"AG={metrics['AG']:.4f} EN={metrics['EN']:.4f} SF={metrics['SF']:.4f} SD={metrics['SD']:.4f}")
 
-    # 保存 CSV/JSON
+    
     import pandas as pd, json
     rows = []
     for ds, m in out_metrics.items():

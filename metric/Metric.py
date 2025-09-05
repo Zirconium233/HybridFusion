@@ -6,11 +6,11 @@ import math
 from .ssim import ssim, ms_ssim
 
 def EN_function(image_array):
-    # 计算图像的直方图
+    
     histogram, bins = np.histogram(image_array, bins=256, range=(0, 255))
-    # 将直方图归一化
+    
     histogram = histogram / float(np.sum(histogram))
-    # 计算熵
+    
     entropy = -np.sum(histogram * np.log2(histogram + 1e-7))
     return entropy
 
@@ -187,22 +187,16 @@ def MI_function(A, B, F, gray_level=256):
     return MI_results
 
 def preprocess_to_gray(img):
-    """
-    将输入图像预处理为灰度图
-    支持格式：
-    - 单通道: (H, W)
-    - 三通道: (H, W, C) 或 (C, H, W)
-    """
-    # 转换为float以保持精度
+
     img = img.astype(float)
     
-    # 判断是否是多通道图像
+    
     if len(img.shape) == 3:
-        # 判断通道维度位置
-        if img.shape[0] == 3:  # channels first (3, H, W)
-            # 转置为 (H, W, C)
+        
+        if img.shape[0] == 3:  
+            
             img = np.transpose(img, (1, 2, 0))
-        # 现在图像格式统一为 (H, W, C)
+        
         img_gray = np.dot(img, [0.2989, 0.5870, 0.1140])
     else:
         img_gray = img
@@ -210,13 +204,8 @@ def preprocess_to_gray(img):
     return img_gray.astype(np.int32)
 
 def preprocess_to_HWC(img):
-     """
-     将输入图像预处理为 (H, W, C) 格式，自动判断原来的通道维度位置
-     支持格式：
-     - 三通道: (H, W, C) 或 (C, H, W)
-     """
      if len(img.shape) == 3:
-        if img.shape[0] == 3:  # channels first (3, H, W)
+        if img.shape[0] == 3:  
             img = np.transpose(img, (1, 2, 0))
      return img
 

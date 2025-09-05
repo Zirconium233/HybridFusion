@@ -19,7 +19,7 @@ from metric.MetricGPU import (
 )
 
 # -------------------------------
-# 固定参数（预编码）
+# Fixed Parameters (Pre-defined)
 # -------------------------------
 DATA_ROOT = "./data/M3SVD/Video/test"
 VISIBLE_DIR = os.path.join(DATA_ROOT, "visible")
@@ -30,13 +30,13 @@ NUM_WORKERS = 4
 PIN_MEMORY = True
 
 CKPT_ROOT = "./checkpoints/stochastic_policy_ycbcr"
-EPOCHS_TO_EVAL = [2, 10]  # 需要评测的epoch
+EPOCHS_TO_EVAL = [2, 10]  # Epochs to evaluate
 OUT_DIR = "./checkpoints/M3SVD_eval"
 os.makedirs(OUT_DIR, exist_ok=True)
 
 torch.backends.cudnn.benchmark = False
 
-# 新增：YCbCr 工具
+# Added: YCbCr Utilities
 def to_01(x: torch.Tensor) -> torch.Tensor:
     return (x.clamp(-1, 1) + 1.0) * 0.5
 def to_m11(x: torch.Tensor) -> torch.Tensor:
@@ -60,7 +60,7 @@ def ycbcr_to_rgb(y_m11: torch.Tensor, cb_m11: torch.Tensor, cr_m11: torch.Tensor
 
 
 # -------------------------------
-# 工具
+# Utilities
 # -------------------------------
 def to_ch_last(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous(memory_format=torch.channels_last)
@@ -71,9 +71,9 @@ def to_255(x: torch.Tensor) -> torch.Tensor:
 
 def rgb_bgr_to_tensor_norm(img_bgr: np.ndarray, to_gray: bool, size_hw: Tuple[int, int]) -> torch.Tensor:
     """
-    将 BGR uint8 图像处理为 tensor [-1,1]
-    - to_gray=False: 输出 3xHxW (RGB)
-    - to_gray=True:  输出 1xHxW (Gray)
+    Processes a BGR uint8 image into a tensor with values in [-1,1].
+    - to_gray=False: Outputs 3xHxW (RGB)
+    - to_gray=True:  Outputs 1xHxW (Gray)
     """
     H, W = size_hw
     if to_gray:
@@ -93,7 +93,7 @@ def rgb_bgr_to_tensor_norm(img_bgr: np.ndarray, to_gray: bool, size_hw: Tuple[in
 
 
 # -------------------------------
-# 数据集（内部实现，读取配对 mp4 并逐帧输出）
+# Dataset (Internal implementation, reads paired mp4s and outputs frame by frame)
 # -------------------------------
 class M3SVDVideoPairDataset(Dataset):
     def __init__(self, vis_dir: str, ir_dir: str, target_size: Tuple[int, int] = (480, 640)):
@@ -105,16 +105,16 @@ class M3SVDVideoPairDataset(Dataset):
         vis_files = sorted([f for f in os.listdir(vis_dir) if f.lower().endswith(".mp4")])
         ir_files = sorted([f for f in os.listdir(ir_dir) if f.lower().endswith(".mp4")])
 
-        # 按文件名配对（去扩展名）
+        # Pair by filename (without extension)
         vis_map = {os.path.splitext(f)[0]: os.path.join(vis_dir, f) for f in vis_files}
         ir_map = {os.path.splitext(f)[0]: os.path.join(ir_dir, f) for f in ir_files}
         common_keys = sorted(set(vis_map.keys()).intersection(set(ir_map.keys())))
         if len(common_keys) == 0:
-            raise RuntimeError("未在可见和红外目录下找到同名的 mp4 对。")
+            raise RuntimeError("No mp4 pairs with matching filenames found in visible and infrared directories.")
 
         self.pairs: List[Tuple[str, str]] = [(vis_map[k], ir_map[k]) for k in common_keys]
 
-        # 预索引每对视频的帧数量，取两者最小值用于对齐
+        # Pre-index the number of frames for each video pair, taking the minimum for alignment
         self.frame_counts: List[int] = []
         for v_path, i_path in self.pairs:
             v_cap = cv2.VideoCapture(v_path)
@@ -125,16 +125,16 @@ class M3SVDVideoPairDataset(Dataset):
             i_cap.release()
             self.frame_counts.append(max(0, min(v_cnt, i_cnt)))
 
-        # 建立全局索引：每个样本对应 (pair_idx, frame_idx)
+        # Create a global index: each sample corresponds to (pair_idx, frame_idx)
         self.index_map: List[Tuple[int, int]] = []
         for pidx, n in enumerate(self.frame_counts):
             for fidx in range(n):
                 self.index_map.append((pidx, fidx))
 
         total_frames = len(self.index_map)
-        print(f"[M3SVD] 总视频对数: {len(self.pairs)}, 总帧数: {total_frames}")
+        print(f"[M3SVD] Total video pairs: {len(self.pairs)}, Total frames: {total_frames}")
 
-        # 惰性打开的缓存（按 worker 进程独享）
+        # Lazily opened cache (exclusive per worker process)
         self._caps_vis: Dict[int, cv2.VideoCapture] = {}
         self._caps_ir: Dict[int, cv2.VideoCapture] = {}
 
@@ -150,11 +150,11 @@ class M3SVDVideoPairDataset(Dataset):
         return cap
 
     def _read_frame(self, cap: cv2.VideoCapture, frame_idx: int) -> np.ndarray:
-        # 直接跳转到指定帧；部分编解码器不精确，但足够做评测
+        # Directly jump to the specified frame; some codecs are not precise, but it's sufficient for evaluation
         cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
         ok, frame = cap.read()
         if not ok or frame is None:
-            # 尝试再次读取（容错），否则返回全零
+            # Try to read again (for fault tolerance), otherwise return all zeros
             ok2, frame2 = cap.read()
             if not ok2 or frame2 is None:
                 return np.zeros((self.target_size[0], self.target_size[1], 3), dtype=np.uint8)
@@ -169,7 +169,7 @@ class M3SVDVideoPairDataset(Dataset):
         cap_i = self._get_cap(i_path, self._caps_ir)
 
         v_bgr = self._read_frame(cap_v, frame_idx)  # HxWx3 BGR
-        i_bgr = self._read_frame(cap_i, frame_idx)  # HxWx3 BGR (有些红外编码成3通道)
+        i_bgr = self._read_frame(cap_i, frame_idx)  # HxWx3 BGR (some IR are encoded as 3 channels)
 
         A = rgb_bgr_to_tensor_norm(v_bgr, to_gray=False, size_hw=self.target_size)  # 3xHxW, [-1,1]
         B = rgb_bgr_to_tensor_norm(i_bgr, to_gray=True, size_hw=self.target_size)   # 1xHxW, [-1,1]
@@ -184,7 +184,7 @@ class M3SVDVideoPairDataset(Dataset):
 
 
 # -------------------------------
-# 评测
+# Evaluation
 # -------------------------------
 @torch.no_grad()
 def evaluate_one_checkpoint(
@@ -195,11 +195,11 @@ def evaluate_one_checkpoint(
     metric_mode: str = "mu",  # 'mu' or 'sample'
 ):
     if not os.path.isfile(ckpt_path):
-        print(f"[Skip] 未找到模型: {ckpt_path}")
+        print(f"[Skip] Model not found: {ckpt_path}")
         return None
 
-    # 模型与融合核
-    # 仅在亮度通道与 IR 融合
+    # Model and fusion kernel
+    # Fusion is only performed on the luminance (Y) channel with IR
     policy_net = PolicyNet(in_channels=2, out_channels=2).to(device)
     state = torch.load(ckpt_path, map_location="cpu")
     policy_net.load_state_dict(state, strict=True)
@@ -207,7 +207,7 @@ def evaluate_one_checkpoint(
 
     fusion_kernel = LaplacianPyramidFusion(num_levels=4).to(device)
 
-    # 聚合容器
+    # Aggregated containers
     all_vif, all_qbf, all_ssim = [], [], []
     all_psnr, all_mse, all_cc, all_scd = [], [], [], []
     all_nabf, all_mi, all_ag, all_en, all_sf, all_sd = [], [], [], [], [], []
@@ -216,7 +216,7 @@ def evaluate_one_checkpoint(
     for A, B in pbar:
         A = to_ch_last(A.to(device=device, dtype=torch.float32))
         B = to_ch_last(B.to(device=device, dtype=torch.float32))
-        # 只取 A 的亮度（Y），与 B(IR) 融合
+        # Take only the luminance (Y) of A and fuse it with B (IR)
         Y, Cb, Cr = rgb_to_ycbcr(A)
         mu, logvar = policy_net(Y, B)
         std = torch.exp(0.5 * logvar)
@@ -229,7 +229,7 @@ def evaluate_one_checkpoint(
 
         F_use = F_hat_mu if metric_mode == "mu" else F_hat_sampled
 
-        # 指标用 0..255
+        # Metrics use 0..255
         A_255 = to_255(A).to(torch.float32)
         B_255 = to_255(B).to(torch.float32)
         F_255 = to_255(F_use).to(torch.float32)
@@ -249,7 +249,7 @@ def evaluate_one_checkpoint(
             all_sf.append(SF_function_batch(F_255).reshape(-1).cpu())
             all_sd.append(SD_function_batch(F_255).reshape(-1).cpu())
         except Exception as e:
-            print(f"[Metrics] 失败: {e}")
+            print(f"[Metrics] Failed: {e}")
             continue
 
     def mean_cat(xs): 
@@ -263,7 +263,7 @@ def evaluate_one_checkpoint(
     }
     metrics["Reward"] = (metrics["VIF"] + 1.5 * metrics["Qabf"] + metrics["SSIM"]) / 3.0
 
-    # 打印
+    # Print
     print(
         f"[Result] {os.path.basename(os.path.dirname(ckpt_path))} | "
         f"Reward={metrics['Reward']:.4f} | "
@@ -273,7 +273,7 @@ def evaluate_one_checkpoint(
         f"AG={metrics['AG']:.4f} EN={metrics['EN']:.4f} SF={metrics['SF']:.4f} SD={metrics['SD']:.4f}"
     )
 
-    # 保存到 json（按模型一次一个，便于追溯）
+    # Save to json (one per model, for traceability)
     with open(f"{save_prefix}.json", "w") as f:
         json.dump(metrics, f, indent=2)
 
@@ -283,7 +283,7 @@ def evaluate_one_checkpoint(
 def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # 数据集与 DataLoader
+    # Dataset and DataLoader
     ds = M3SVDVideoPairDataset(VISIBLE_DIR, INFRA_DIR, target_size=TARGET_SIZE)
     dl = DataLoader(
         ds, batch_size=BATCH_SIZE, shuffle=False,
@@ -301,10 +301,10 @@ def main():
             rows.append(row)
 
     if len(rows) == 0:
-        print("[Done] 无可用结果（可能是模型权重不存在）。")
+        print("[Done] No results available (model weights may not exist).")
         return
 
-    # 保存汇总 CSV
+    # Save summary CSV
     df = pd.DataFrame(rows)
     csv_path = os.path.join(OUT_DIR, "metrics_M3SVD_summary.csv")
     df.to_csv(csv_path, index=False)

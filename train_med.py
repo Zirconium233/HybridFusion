@@ -16,7 +16,7 @@ from model.traditional_fusion import LaplacianPyramidFusion
 from metric.MetricGPU import VIF_function_batch, Qabf_function_batch, SSIM_function_batch
 
 # -------------------------------
-# 配置
+# Configuration
 # -------------------------------
 EPOCHS: int = 500
 LR: float = 1e-4
@@ -35,7 +35,7 @@ SAVE_FREQ: int = 50
 SAVE_MODELS: bool = True
 METRIC_MODE: str = "mu"  # mu or sample
 
-# FusionLoss 权重（与 train.py 对齐）
+# FusionLoss weights (aligned with train.py)
 LOSS_MAX_RATIO: float = 10.0
 LOSS_CONSIST_RATIO: float = 2.0
 LOSS_GRAD_RATIO: float = 40.0
@@ -48,8 +48,8 @@ LOSS_CONSIST_MODE: str = "l1"
 LOSS_SSIM_WINDOW: int = 48
 
 # -------------------------------
-# 数据集路径（参考 Image/train.py）
-# A 为 PET/CT/SPECT，B 为 MRI
+# Dataset paths (reference from Image/train.py)
+# A is PET/CT/SPECT, B is MRI
 # -------------------------------
 MED_DATASETS: Dict[str, Dict[str, Dict[str, str]]] = {
     "PET": {
@@ -73,7 +73,7 @@ torch.backends.cudnn.benchmark = False
 
 
 # -------------------------------
-# 工具函数
+# Utility Functions
 # -------------------------------
 def to_ch_last(x: torch.Tensor) -> torch.Tensor:
     return x.contiguous(memory_format=torch.channels_last)
@@ -88,7 +88,7 @@ def save_image_grid(path: str, img: torch.Tensor, nrow: int = 4):
     x = img.detach().to(torch.float32).cpu().clamp(-1, 1)
     save_image(x, path, nrow=min(nrow, x.size(0)), normalize=True, value_range=(-1, 1), padding=2)
 
-# 新增：YCbCr 工具（仅在 PET/SPECT 走 Y 通道融合；CT 直接灰度融合）
+# Added: YCbCr Utilities (fuse on Y channel only for PET/SPECT; CT is fused directly as grayscale)
 def to_m11(x: torch.Tensor) -> torch.Tensor:
     return x.clamp(0, 1) * 2.0 - 1.0
 
@@ -114,14 +114,14 @@ def make_3ch(x: torch.Tensor) -> torch.Tensor:
     return x if x.shape[1] == 3 else x.repeat(1, 3, 1, 1)
 
 def make_1ch(x: torch.Tensor) -> torch.Tensor:
-    # 若为3通道，转为灰度；若为1通道，直接返回
+    # If it's a 3-channel image, convert to grayscale; if 1-channel, return as is.
     if x.shape[1] == 1:
         return x
-    # 简单平均到灰度（避免引入额外依赖）
+    # Simple averaging to grayscale (to avoid extra dependencies)
     return x.mean(dim=1, keepdim=True)
 
 def build_train_loader_for_task(task: str) -> DataLoader:
-    # 仅使用 test 集做训练（公平对比）
+    # Use only the test set for training (for fair comparison)
     paths = MED_DATASETS[task]["test"]
     ds = ImageFusionDataset(
         dir_A=paths["dir_A"], dir_B=paths["dir_B"], dir_C=None,
@@ -148,7 +148,7 @@ def build_test_loaders_for_targets(targets: List[str]) -> Dict[str, DataLoader]:
 
 
 # -------------------------------
-# 评估
+# Evaluation
 # -------------------------------
 @torch.no_grad()
 def evaluate_and_log_med(
@@ -160,7 +160,7 @@ def evaluate_and_log_med(
     epoch: int,
     metric_mode: str = "mu",
 ):
-    # 更多指标
+    # More metrics
     from metric.MetricGPU import (
         PSNR_function_batch, MSE_function_batch, CC_function_batch, SCD_function_batch,
         Nabf_function_batch, MI_function_batch, EN_function_batch, SF_function_batch,
@@ -186,11 +186,11 @@ def evaluate_and_log_med(
                 raise RuntimeError("Test batch should provide (A,B[,C]).")
             A, B = batch[0], batch[1]
 
-            # 对齐 device/dtype，并处理通道
+            # Align device/dtype and handle channels
             A = to_ch_last(A.to(device=device, dtype=model_dtype))
             B = to_ch_last(B.to(device=device, dtype=model_dtype))
-            B1 = make_1ch(B)          # MRI -> 1通道红外侧
-            # PET/SPECT: 仅在亮度 Y 与 IR 融合；CT: 直接灰度融合
+            B1 = make_1ch(B)     # MRI -> 1-channel IR side
+            # PET/SPECT: Fuse on luminance Y channel only with IR; CT: Fuse directly as grayscale
             if A.shape[1] == 3:
                 A3 = make_3ch(A)
                 Y, Cb, Cr = rgb_to_ycbcr(A3)
@@ -198,11 +198,11 @@ def evaluate_and_log_med(
                 Y = make_1ch(A)
                 Cb = Cr = None
 
-            # Policy 输出
+            # Policy output
             mu, logvar = policy_net(Y, B1)
             std = torch.exp(0.5 * logvar)
 
-            # 融合
+            # Fusion
             F_Y_mu = fusion_kernel(Y, B1, mu)
             sampled_w = torch.clamp(mu + torch.randn_like(std) * std, 0.0, 1.0)
             F_Y_sampled = fusion_kernel(Y, B1, sampled_w)
@@ -215,7 +215,7 @@ def evaluate_and_log_med(
                 F_hat_sampled = F_Y_sampled.repeat(1, 3, 1, 1)
                 A_for_metric = Y.repeat(1, 3, 1, 1)
 
-            # 仅第一个 batch 保存图像
+            # Save images for the first batch only
             if batch_idx == 0 and SAVE_IMAGES_TO_DIR and accelerator.is_main_process:
                 out_dir = os.path.join(project_dir, "images", f"epoch_{epoch}", set_name)
                 os.makedirs(out_dir, exist_ok=True)
@@ -225,7 +225,7 @@ def evaluate_and_log_med(
                 save_image_grid(os.path.join(out_dir, f"F_mu_e{epoch:04d}.png"), F_hat_mu)
                 save_image_grid(os.path.join(out_dir, f"F_sample_e{epoch:04d}.png"), F_hat_sampled)
 
-            # 指标
+            # Metrics
             A_255 = to_255(A_for_metric).to(torch.float32)
             B_255 = to_255(B1).to(torch.float32)
             F_use = F_hat_mu if metric_mode == "mu" else F_hat_sampled
@@ -246,7 +246,7 @@ def evaluate_and_log_med(
                 sf = SF_function_batch(F_255)
                 sd = SD_function_batch(F_255)
 
-                # 多进程聚合
+                # Aggregate across processes
                 vif_all = accelerator.gather_for_metrics(vif.reshape(-1)).float().cpu()
                 qbf_all = accelerator.gather_for_metrics(qbf.reshape(-1)).float().cpu()
                 ssim_all = accelerator.gather_for_metrics(ssim.reshape(-1)).float().cpu()
@@ -293,7 +293,7 @@ def evaluate_and_log_med(
             "Nabf": nabf_mean, "MI": mi_mean, "AG": ag_mean, "EN": en_mean, "SF": sf_mean, "SD": sd_mean,
         }
 
-    # 保存 CSV/JSON
+    # Save CSV/JSON
     if accelerator.is_main_process:
         import pandas as pd, json
         rows = []
@@ -311,7 +311,7 @@ def evaluate_and_log_med(
 
 
 # -------------------------------
-# 单任务训练与评测
+# Single-task Training and Evaluation
 # -------------------------------
 def train_one_task(task: str, eval_targets: List[str]):
     task_dir = os.path.join(BASE_PROJECT_DIR, task)
@@ -330,12 +330,12 @@ def train_one_task(task: str, eval_targets: List[str]):
         for t in eval_targets:
             print(f"[Eval Target] {t}")
 
-    # 数据：使用 test 集训练
+    # Data: Use test set for training
     train_loader = build_train_loader_for_task(task)
     test_loaders = build_test_loaders_for_targets(eval_targets)
 
-    # 模型与损失
-    # 统一使用 Y+IR 两通道输入；CT 也为 1+1 通道
+    # Model and Loss
+    # Use Y+IR two-channel input uniformly; CT is also 1+1 channels
     policy_net = PolicyNet(in_channels=2, out_channels=2)
     fusion_kernel = LaplacianPyramidFusion(num_levels=4)
     fusion_loss_fn = FusionLoss(
@@ -353,10 +353,10 @@ def train_one_task(task: str, eval_targets: List[str]):
 
     optimizer = torch.optim.AdamW(policy_net.parameters(), lr=LR, weight_decay=1e-4)
 
-    # accelerate
+    # Accelerate
     policy_net, optimizer, train_loader = accelerator.prepare(policy_net, optimizer, train_loader)
 
-    # 放置到 device/dtype
+    # Place on device/dtype
     model_dtype = next(accelerator.unwrap_model(policy_net).parameters()).dtype
     fusion_kernel = fusion_kernel.to(device=accelerator.device, dtype=model_dtype)
     fusion_loss_fn = fusion_loss_fn.to(device=accelerator.device, dtype=model_dtype)
@@ -372,11 +372,11 @@ def train_one_task(task: str, eval_targets: List[str]):
                 raise RuntimeError("Train batch should provide (A,B[,C]).")
             A, B = batch[0], batch[1]
 
-            # 对齐 device/dtype 并通道处理
+            # Align device/dtype and handle channels
             A = to_ch_last(A.to(device=accelerator.device, dtype=model_dtype))
             B = to_ch_last(B.to(device=accelerator.device, dtype=model_dtype))
             B1 = make_1ch(B)    # MRI -> 1ch
-            # PET/SPECT: 仅在亮度 Y 与 IR 融合；CT: 直接灰度融合
+            # PET/SPECT: Fuse on luminance Y only; CT: Fuse directly on grayscale
             if A.shape[1] == 3:
                 A3 = make_3ch(A)
                 Y, Cb, Cr = rgb_to_ycbcr(A3)
@@ -385,11 +385,11 @@ def train_one_task(task: str, eval_targets: List[str]):
                 Cb = Cr = None
 
             with accelerator.accumulate(policy_net):
-                # 策略网络（输入两通道：Y 与 B1）
+                # Policy network (input two channels: Y and B1)
                 mu, logvar = policy_net(Y, B1)
                 std = torch.exp(0.5 * logvar)
 
-                # 融合（确定性：mu）在 Y 上进行；CT 时直接灰度，PET/SPECT 复原 RGB
+                # Fusion (deterministic: mu) is performed on Y; For CT, it's directly grayscale; For PET/SPECT, restore RGB
                 F_Y = fusion_kernel(Y, B1, mu)
                 if Cb is not None:
                     F_hat = ycbcr_to_rgb(F_Y, Cb, Cr)
@@ -398,11 +398,11 @@ def train_one_task(task: str, eval_targets: List[str]):
                     F_hat = F_Y.repeat(1, 3, 1, 1)
                     A_for_loss = Y.repeat(1, 3, 1, 1)
 
-                # 自监督损失（B_for_loss 扩到3通道）
+                # Self-supervised loss (B_for_loss expanded to 3 channels)
                 B_for_loss = B1.repeat(1, 3, 1, 1)
                 fusion_loss = fusion_loss_fn(A_for_loss, B_for_loss, F_hat)
 
-                # KL 正则
+                # KL Regularization
                 kld_loss = -0.5 * torch.mean(1 + logvar - mu.pow(2) - logvar.exp())
                 total_loss = fusion_loss * LOSS_SCALE_FACTOR + KL_WEIGHT * kld_loss
 
@@ -431,7 +431,7 @@ def train_one_task(task: str, eval_targets: List[str]):
                     step=global_step,
                 )
 
-        # 统计
+        # Statistics
         stats_local = torch.tensor([epoch_total, epoch_fusion, epoch_kld, epoch_n], device=accelerator.device, dtype=torch.float64)
         stats_all = accelerator.gather_for_metrics(stats_local)
         if stats_all.ndim == 1: stats_all = stats_all.unsqueeze(0)
@@ -444,7 +444,7 @@ def train_one_task(task: str, eval_targets: List[str]):
             print(f"[{task}][Epoch {epoch}] avg_total={avg_total:.4f}  avg_fusion={avg_fusion:.4f}  avg_kld={avg_kld:.6f}")
             accelerator.log({"epoch/avg_total": avg_total, "epoch/avg_fusion": avg_fusion, "epoch/avg_kld": avg_kld}, step=epoch)
 
-        # 评测
+        # Evaluation
         if epoch % TEST_FREQ == 0 or epoch == EPOCHS:
             _ = evaluate_and_log_med(
                 accelerator=accelerator,
@@ -456,7 +456,7 @@ def train_one_task(task: str, eval_targets: List[str]):
                 metric_mode=METRIC_MODE,
             )
 
-        # 保存
+        # Save checkpoint
         if SAVE_MODELS and SAVE_FREQ > 0 and (epoch % SAVE_FREQ == 0) and accelerator.is_main_process:
             save_dir = os.path.join(task_dir, f"epoch_{epoch}")
             os.makedirs(save_dir, exist_ok=True)
@@ -478,13 +478,13 @@ def train_one_task(task: str, eval_targets: List[str]):
 
 
 # -------------------------------
-# 主流程：顺序跑 PET、SPECT、CT
-# PET/SPECT 互相 cross-eval；CT 仅自测
+# Main Process: Run PET, SPECT, CT sequentially
+# PET/SPECT cross-evaluate each other; CT is self-tested only
 # -------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--task", type=str, default="ALL", choices=["ALL", "PET", "SPECT", "CT"],
-                        help="选择要运行的任务；默认 ALL 顺序运行 PET、SPECT、CT")
+                        help="Select task to run; default ALL runs PET, SPECT, CT sequentially.")
     args = parser.parse_args()
 
     os.makedirs(BASE_PROJECT_DIR, exist_ok=True)
@@ -492,9 +492,9 @@ def main():
     runs: List[Tuple[str, List[str]]] = []
     if args.task == "ALL":
         runs = [
-            ("PET",   ["PET", "SPECT"]),  # 自测 PET + 跨任务 SPECT
-            ("SPECT", ["SPECT", "PET"]),  # 自测 SPECT + 跨任务 PET
-            ("CT",    ["CT"]),            # 仅自测
+            ("PET",   ["PET", "SPECT"]),  # Self-test PET + cross-task SPECT
+            ("SPECT", ["SPECT", "PET"]),  # Self-test SPECT + cross-task PET
+            ("CT",    ["CT"]),           # Self-test only
         ]
     elif args.task == "PET":
         runs = [("PET", ["PET", "SPECT"])]

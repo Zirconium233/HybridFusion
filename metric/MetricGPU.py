@@ -4,7 +4,7 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-# 引入 CPU 版本用于对比
+
 from .Metric import (
     EN_function as EN_cpu,
     SF_function as SF_cpu,
@@ -22,21 +22,21 @@ from .Metric import (
     MS_SSIM_function as MS_SSIM_cpu,
 )
 
-# 复用已有的 torch-based ssim 实现内部工具
+
 from . import ssim as ssim_module
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# ----------------------
-# 辅助：把输入标准化为 (B, C, H, W) torch.float32，范围 0-255，不做归一化
-# 支持 numpy 或 torch 输入
-# ----------------------
+
+
+
+
 def _to_tensor_batch(x, device=DEVICE, dtype=torch.float32):
     """
-    接受 x 为:
+    Accepts x as:
       - numpy array: (H,W,C), (C,H,W), (B,H,W,C), (B,C,H,W)
       - torch tensor: same shapes
-    返回 (B, C, H, W) float32 tensor on device
+    Returns (B, C, H, W) float32 tensor on device
     """
     if isinstance(x, np.ndarray):
         t = torch.from_numpy(x)
@@ -45,18 +45,18 @@ def _to_tensor_batch(x, device=DEVICE, dtype=torch.float32):
 
     t = t.to(dtype=torch.float32)
     if t.dim() == 2:
-        t = t.unsqueeze(0).unsqueeze(0)  # (1,1,H,W)
+        t = t.unsqueeze(0).unsqueeze(0)  
     elif t.dim() == 3:
-        # could be (H,W,C) or (C,H,W)
-        if t.shape[0] == 3:  # channels first
-            t = t.unsqueeze(0)  # (1,3,H,W)
+        
+        if t.shape[0] == 3:  
+            t = t.unsqueeze(0)  
         else:
-            # assume (H,W,C)
-            t = t.permute(2, 0, 1).unsqueeze(0)  # (1,C,H,W)
+            
+            t = t.permute(2, 0, 1).unsqueeze(0)  
     elif t.dim() == 4:
-        # Could be (B,H,W,C) or (B,C,H,W)
+        
         if t.shape[-1] == 3 and t.shape[1] != 3:
-            # (B,H,W,C) -> (B,C,H,W)
+            
             t = t.permute(0, 3, 1, 2)
     else:
         raise ValueError("Unsupported tensor shape for _to_tensor_batch: %s" % (t.shape,))
@@ -64,38 +64,30 @@ def _to_tensor_batch(x, device=DEVICE, dtype=torch.float32):
     return t.to(device=device, dtype=dtype)
 
 
-# ----------------------
-# 预处理为灰度 (B,1,H,W) 保持数值范围 0-255，与 CPU preprocess_to_gray 行为一致（使用相同系数）
-# ----------------------
 def preprocess_to_gray_batch(x):
-    t = _to_tensor_batch(x)  # (B,C,H,W)
+    t = _to_tensor_batch(x)  
     if t.shape[1] == 1:
         gray = t
     else:
-        # assume RGB channels order
+        
         r = t[:, 0:1, :, :]
         g = t[:, 1:2, :, :]
         b = t[:, 2:3, :, :]
-        # 使用与 CPU 相同的加权，然后模仿 CPU 的 astype(np.int32) 截断行为
+        
         gray_f = 0.2989 * r + 0.5870 * g + 0.1140 * b
-        # clamp 到 [0,255]，然后按 CPU 的 astype(int) 做截断（向零）
+        
         gray = torch.clamp(gray_f, 0.0, 255.0)
-        gray = gray.to(torch.long).to(torch.float32)  # 保持数值为整数但类型为 float32 以便后续运算
-    return gray  # float tensor (B,1,H,W)
+        gray = gray.to(torch.long).to(torch.float32)  
+    return gray  
 
-
-# ----------------------
-# EN (熵) GPU 版本
-# 使用 torch.bincount（按 sample 循环），保持与 CPU 的 256 bins 和 range (0,255)
-# ----------------------
 def EN_function_batch(x):
     """
-    与 CPU 保持一致：对原始图像所有通道的像素做直方图统计（不灰度化），bins=256, range=[0,255]
-    返回: (B,)
+    Consistent with CPU: Perform histogram statistics on pixels of all channels of the original image (without grayscale conversion), bins=256, range=[0,255]
+    Returns: (B,)
     """
-    t = _to_tensor_batch(x)  # (B,C,H,W), float32
+    t = _to_tensor_batch(x)  
     B = t.shape[0]
-    vals = torch.clamp(t, 0.0, 255.0).to(torch.long)  # 截断为整型索引
+    vals = torch.clamp(t, 0.0, 255.0).to(torch.long)  
     vals = vals.reshape(B, -1)
     outs = []
     for i in range(B):
@@ -106,31 +98,26 @@ def EN_function_batch(x):
     return torch.stack(outs)
 
 
-# ----------------------
-# SF (Spatial Frequency) GPU 版本
-# ----------------------
-# 文件: metric/MetricGPU.py
-
 def SF_function_batch(x):
     """
-    与 CPU 行为完全对齐：
-    - 在整数域模拟 uint8 的差分环绕（mod 256）
-    - 在整数域上也模拟 uint8 平方的模 256 溢出（即 (v*v) % 256）
-    - 最后转为高精度浮点做 mean/sqrt，复现 numpy(uint8) 路径
+    Behavior is fully aligned with CPU(Bug level aligned. SF lower than MATLAB version, not used in paper):
+    - Simulate uint8 differential wrapping in integer domain (mod 256)
+    - Also simulate mod 256 overflow for uint8 squares in integer domain (i.e., (v*v) % 256)
+    - Finally convert to high-precision float for mean/sqrt to reproduce numpy(uint8) path
     """
-    t = _to_tensor_batch(x)  # (B,C,H,W) float32 但数值为 0..255
-    # 保证整数语义，然后转为 int32 做中间计算（避免 PyTorch 在 uint8 上不支持某些 ops）
+    t = _to_tensor_batch(x)  
+    
     t_int = torch.clamp(t, 0.0, 255.0).to(torch.int32)
 
-    # 在 int32 上做减法，然后对 256 取模以复现 uint8 环绕（0..255）
-    rf_mod = torch.remainder(t_int[:, :, 1:, :] - t_int[:, :, :-1, :], 256)  # 0..255
-    cf_mod = torch.remainder(t_int[:, :, :, 1:] - t_int[:, :, :, :-1], 256)  # 0..255
+    
+    rf_mod = torch.remainder(t_int[:, :, 1:, :] - t_int[:, :, :-1, :], 256)  
+    cf_mod = torch.remainder(t_int[:, :, :, 1:] - t_int[:, :, :, :-1], 256)  
 
-    # 模拟 numpy(uint8) 上的平方溢出：在整数域做 (v*v) % 256
-    rf_sq_mod = torch.remainder(rf_mod * rf_mod, 256)  # 仍然 0..255
+    
+    rf_sq_mod = torch.remainder(rf_mod * rf_mod, 256)  
     cf_sq_mod = torch.remainder(cf_mod * cf_mod, 256)
 
-    # 转为 float64 做均值与开根号（与 CPU numpy 的数值流程对齐）
+    
     B = rf_sq_mod.shape[0]
     rf_sq_f = rf_sq_mod.to(torch.float64).reshape(B, -1)
     cf_sq_f = cf_sq_mod.to(torch.float64).reshape(B, -1)
@@ -142,24 +129,18 @@ def SF_function_batch(x):
     return SF
 
 
-# ----------------------
-# SD (Std dev) GPU 版本
-# ----------------------
 def SD_function_batch(x):
-    gray = preprocess_to_gray_batch(x)  # (B,1,H,W)
+    gray = preprocess_to_gray_batch(x)  
     B = gray.shape[0]
-    # flatten per image
+    
     vals = gray.view(B, -1)
     mu = vals.mean(dim=1, keepdim=True)
     SD = torch.sqrt(((vals - mu) ** 2).sum(dim=1) / vals.shape[1])
     return SD
 
 
-# ----------------------
-# MSE and PSNR GPU 版本（遵循 CPU 版数值步骤）
-# ----------------------
 def MSE_function_batch(A, B, F):
-    A_t = preprocess_to_gray_batch(A) / 255.0  # (B,1,H,W)
+    A_t = preprocess_to_gray_batch(A) / 255.0  
     B_t = preprocess_to_gray_batch(B) / 255.0
     F_t = preprocess_to_gray_batch(F) / 255.0
     Bsize = F_t.shape[0]
@@ -173,22 +154,19 @@ def MSE_function_batch(A, B, F):
 
 def PSNR_function_batch(A, B, F):
     MSE = MSE_function_batch(A, B, F)
-    # follow CPU formula: PSNR = 20 * log10(255/ sqrt(MSE))
+    
     psnr = 20.0 * torch.log10(torch.tensor(255.0, device=MSE.device) / torch.sqrt(MSE.clamp(min=1e-12)))
     return psnr
 
 
-# ----------------------
-# AG (Average Gradient) GPU 版本
-# ----------------------
 def AG_function_batch(x):
-    # 对应 CPU np.gradient 后的处理，使用与 CPU 相匹配的整数化灰度并用中心差分（边界用一阶差分）
-    gray = preprocess_to_gray_batch(x)  # (B,1,H,W) — 已经是整数值的 float
+    
+    gray = preprocess_to_gray_batch(x)  
     B, C, H, W = gray.shape
-    # compute gradients similar to np.gradient
+    
     gx = torch.zeros_like(gray)
     gy = torch.zeros_like(gray)
-    # central differences for interior
+    
     if H >= 3:
         gy[:, :, 1:-1, :] = (gray[:, :, 2:, :] - gray[:, :, :-2, :]) / 2.0
     else:
@@ -197,23 +175,20 @@ def AG_function_batch(x):
         gx[:, :, :, 1:-1] = (gray[:, :, :, 2:] - gray[:, :, :, :-2]) / 2.0
     else:
         gx[:, :, :, 1:-1] = 0.0
-    # forward/backward differences at borders
+    
     gy[:, :, 0, :] = gray[:, :, 1, :] - gray[:, :, 0, :]
     gy[:, :, -1, :] = gray[:, :, -1, :] - gray[:, :, -2, :]
     gx[:, :, :, 0] = gray[:, :, :, 1] - gray[:, :, :, 0]
     gx[:, :, :, -1] = gray[:, :, :, -1] - gray[:, :, :, -2]
     s = torch.sqrt((gx ** 2 + gy ** 2) / 2.0)
-    # CPU 中 denominator = (width-1)*(height-1)
+    
     denom = max(1, (W - 1) * (H - 1))
     AG = s.view(B, -1).sum(dim=1) / float(denom)
     return AG
 
 
-# ----------------------
-# 相关性函数 corr2 和 SCD
-# ----------------------
 def corr2_batch(a, b):
-    # a,b: (B,1,H,W)
+    
     B = a.shape[0]
     a_v = a.view(B, -1)
     b_v = b.view(B, -1)
@@ -222,7 +197,6 @@ def corr2_batch(a, b):
     num = ((a_v - a_m) * (b_v - b_m)).sum(dim=1)
     den = torch.sqrt(((a_v - a_m) ** 2).sum(dim=1) * ((b_v - b_m) ** 2).sum(dim=1)).clamp(min=1e-12)
     return num / den
-
 
 def CC_function_batch(A, B, F):
     A_t = preprocess_to_gray_batch(A)
@@ -241,9 +215,6 @@ def SCD_function_batch(A, B, F):
     return r
 
 
-# ----------------------
-# VIF (vifp_mscale) GPU 版本（尽量翻译原逻辑）
-# ----------------------
 def fspecial_gaussian_torch(shape, sigma, device=DEVICE):
     m = (shape[0] - 1.0) / 2.0
     n = (shape[1] - 1.0) / 2.0
@@ -258,16 +229,15 @@ def fspecial_gaussian_torch(shape, sigma, device=DEVICE):
 
 
 def vifp_mscale_batch(ref, dist):
-    # ref, dist: (B,1,H,W)
     sigma_nsq = 2.0
     num = ref.new_zeros(ref.shape[0])
     den = ref.new_zeros(ref.shape[0])
     for scale in range(1, 5):
         N = 2 ** (4 - scale + 1) + 1
-        win = fspecial_gaussian_torch((N, N), N / 5.0, device=ref.device)  # (N,N)
+        win = fspecial_gaussian_torch((N, N), N / 5.0, device=ref.device)  
         win_t = win.view(1, 1, N, N)
         if scale > 1:
-            # convolve then downsample by 2
+            
             ref = F.conv2d(ref, win_t, padding=0)
             dist = F.conv2d(dist, win_t, padding=0)
             ref = ref[:, :, ::2, ::2]
@@ -314,24 +284,21 @@ def VIF_function_batch(A, B, F):
     return vA + vB
 
 
-# ----------------------
-# QABF / NABF GPU 实现（直接翻译原代码到 torch，保持数值路径一致）
-# ----------------------
-# Qabf.get_Qabf 逻辑翻译
+
 def get_Qabf_batch(pA, pB, pF):
-    # inputs pA/pB/pF: (B,1,H,W) float
+    
     B = pA.shape[0]
     device = pA.device
-    # Sobel kernels as in CPU Qabf
+    
     h1 = torch.tensor([[1, 2, 1], [0, 0, 0], [-1, -2, -1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
     h3 = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=device).view(1, 1, 3, 3)
 
     def getArray(img):
-        # pad with zeros one row/col like CPU convolution(data, flip(k)) with pad 1 then valid -> conv2d(padding=1)
+        
         SAx = F.conv2d(img, h3, padding=1)
         SAy = F.conv2d(img, h1, padding=1)
         gA = torch.sqrt(SAx * SAx + SAy * SAy)
-        # angle
+        
         zero_mask = (SAx == 0)
         aA = torch.atan(torch.where(zero_mask, torch.ones_like(SAy) * 1.0, SAy / (SAx + 1e-12)))
         aA = torch.where(zero_mask, torch.ones_like(aA) * (math.pi / 2), aA)
@@ -341,14 +308,14 @@ def get_Qabf_batch(pA, pB, pF):
     gB, aB = getArray(pB)
     gF, aF = getArray(pF)
 
-    # compute QAF per pixel
+    
     Tg = 0.9994; kg = -15; Dg = 0.5
     Ta = 0.9879; ka = -22; Da = 0.8
 
     def getQabf(aA_, gA_, aF_, gF_):
         mask = (gA_ > gF_)
-        # GAF expression: if gA>gF then gF/gA else if gA==gF gF else gA/gF
-        # implement vectorized:
+        
+        
         equal_mask = (gA_ == gF_)
         GAF = torch.where(mask, gF_ / (gA_ + 1e-12), torch.where(equal_mask, gF_, gA_ / (gF_ + 1e-12)))
         AAF = 1 - torch.abs(aA_ - aF_) / (math.pi / 2)
@@ -364,17 +331,16 @@ def get_Qabf_batch(pA, pB, pF):
     return output
 
 
-# Nabf.get_Nabf 逻辑翻译（基于原 Nabf.py，包含周期扩展 sobel）
 def _per_extn_im_fn_torch(x, wsize):
-    # x: (B,1,H,W)
+    
     hwsize = (wsize - 1) // 2
     B, C, p, q = x.shape
     pad = wsize - 1
     out = x.new_zeros((B, C, p + pad, q + pad))
     out[:, :, hwsize: p + hwsize, hwsize: q + hwsize] = x
-    # The original periodic extension implementation used some specific indexing.
-    # For compatibility we replicate similar behaviour by filling edges with nearby rows/cols.
-    # Note: this replicates the CPU behavior sufficiently for matching results.
+    
+    
+    
     if wsize - 1 == hwsize + 1:
         out[:, :, 0:hwsize, :] = out[:, :, 2:3, :].expand(-1, -1, hwsize, -1)
         out[:, :, p + hwsize: p + wsize - 1, :] = out[:, :, -3:-2, :].expand(-1, -1, hwsize, -1)
@@ -384,7 +350,7 @@ def _per_extn_im_fn_torch(x, wsize):
 
 
 def sobel_fn_torch(x):
-    # x: (B,1,H,W)
+    
     vtemp = torch.tensor([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], dtype=torch.float32, device=x.device).view(1, 1, 3, 3) / 8.0
     htemp = torch.tensor([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], dtype=torch.float32, device=x.device).view(1, 1, 3, 3) / 8.0
     a, b = htemp.shape[-2], htemp.shape[-1]
@@ -395,7 +361,7 @@ def sobel_fn_torch(x):
 
 
 def get_Nabf_batch(I1, I2, f):
-    # Inputs: (B,1,H,W)
+    
     Td = 2.0
     wt_min = 0.001
     P = 1
@@ -418,10 +384,8 @@ def get_Nabf_batch(I1, I2, f):
     gvF, ghF = sobel_fn_torch(xrcw)
     gF = torch.sqrt(ghF ** 2 + gvF ** 2)
 
-    # relative edge strengths
     gAF = torch.zeros_like(gA)
     gBF = torch.zeros_like(gB)
-    # a angles
     aA = torch.where((gvA == 0) & (ghA == 0), torch.zeros_like(gvA), torch.atan(gvA / (ghA + 1e-12)))
     aB = torch.where((gvB == 0) & (ghB == 0), torch.zeros_like(gvB), torch.atan(gvB / (ghB + 1e-12)))
     aF = torch.where((gvF == 0) & (ghF == 0), torch.zeros_like(gvF), torch.atan(gvF / (ghF + 1e-12)))
@@ -460,7 +424,6 @@ def get_Nabf_batch(I1, I2, f):
     return NABF
 
 
-# 外部调用包装函数
 def Qabf_function_batch(A, B, F):
     A_t = preprocess_to_gray_batch(A)
     B_t = preprocess_to_gray_batch(B)
@@ -475,14 +438,10 @@ def Nabf_function_batch(A, B, F):
     return get_Nabf_batch(A_t, B_t, F_t)
 
 
-# ----------------------
-# MI (基于 Hab) GPU 版本
-# ----------------------
+
+
+
 def Hab_batch(im1, im2, gray_level=256):
-    """
-    与 CPU 对齐：灰度已是整数（preprocess_to_gray_batch 里按 astype 行为截断），
-    这里不再 round，直接作为索引。
-    """
     B = im1.shape[0]
     im1_inds = torch.clamp(im1, 0.0, 255.0).to(torch.long).view(B, -1)
     im2_inds = torch.clamp(im2, 0.0, 255.0).to(torch.long).view(B, -1)
@@ -496,7 +455,7 @@ def Hab_batch(im1, im2, gray_level=256):
         h = h / h.sum().clamp(min=1.0)
         im1_marg = h.sum(dim=0)
         im2_marg = h.sum(dim=1)
-        # 仅在非零处求和，避免 log2(0)
+        
         H_x = torch.sum(im1_marg[im1_marg > 0] * torch.log2(im1_marg[im1_marg > 0]))
         H_y = torch.sum(im2_marg[im2_marg > 0] * torch.log2(im2_marg[im2_marg > 0]))
         H_xy = torch.sum(h[h > 0] * torch.log2(h[h > 0]))
@@ -514,37 +473,32 @@ def MI_function_batch(A, B, F, gray_level=256):
     return MIA + MIB
 
 
-# ----------------------
-# SSIM / MS-SSIM：用 float64 + 1D 可分离高斯 + reflect padding
-# ----------------------
 def _fspecial_gauss_1d_torch(size, sigma, device, dtype):
     coords = torch.arange(size, dtype=dtype, device=device)
     coords -= size // 2
     g = torch.exp(-(coords ** 2) / (2 * (torch.tensor(sigma, dtype=dtype, device=device) ** 2)))
     g = g / g.sum()
-    return g  # (size,)
+    return g  
 
 def _gaussian_filter_separable(X, g1d):
     """
-    对 (B,C,H,W) 做 1D 高斯卷积，使用 'valid' 卷积（无padding）以匹配 CPU
+    Perform 1D Gaussian convolution on (B,C,H,W) using 'valid' convolution (no padding)
     """
     B, C, H, W = X.shape
     k = g1d.numel()
-    # 垂直卷积
+    
     wv = g1d.view(1, 1, k, 1).repeat(C, 1, 1, 1)
     Yv = F.conv2d(X, wv, padding=0, groups=C)
-    # 水平卷积
+    
     wh = g1d.view(1, 1, 1, k).repeat(C, 1, 1, 1)
     Y = F.conv2d(Yv, wh, padding=0, groups=C)
     return Y
 
 def _ssim_torch(X, Y, data_range=255.0, win_size=11, win_sigma=1.5, K=(0.01, 0.03)):
-    # 统一用 float64 计算，降低数值误差
+    
     X = X.to(torch.float64)
     Y = Y.to(torch.float64)
 
-    # 关键修正：复现 CPU 版本的 data range bug
-    # CPU 代码错误地将 [0, 255] 的数据又乘以了 255，我们需要在这里模拟
     X = X * 255.0
     Y = Y * 255.0
 
@@ -553,7 +507,7 @@ def _ssim_torch(X, Y, data_range=255.0, win_size=11, win_sigma=1.5, K=(0.01, 0.0
     C = X.shape[1]
     g1d = _fspecial_gauss_1d_torch(win_size, win_sigma, device, dtype=torch.float64)
     
-    # C1 和 C2 仍然使用 data_range=255 来计算，这也是 bug 的一部分
+    
     C1 = (K1 * data_range) ** 2
     C2 = (K2 * data_range) ** 2
 
@@ -581,12 +535,12 @@ def _ssim_torch(X, Y, data_range=255.0, win_size=11, win_sigma=1.5, K=(0.01, 0.0
 def ssim_batch(X, Y, data_range=255.0, win_size=11, win_sigma=1.5, K=(0.01, 0.03), size_average=True):
     ssim_per_channel, _ = _ssim_torch(X, Y, data_range=data_range, win_size=win_size, win_sigma=win_sigma, K=K)
     if size_average:
-        return ssim_per_channel.mean(dim=1).to(torch.float32)  # (B,)
+        return ssim_per_channel.mean(dim=1).to(torch.float32)  
     else:
-        return ssim_per_channel.to(torch.float32)  # (B,C)
+        return ssim_per_channel.to(torch.float32)  
 
 def ms_ssim_batch(X, Y, data_range=255.0, win_size=11, win_sigma=1.5, weights=None, K=(0.01,0.03), size_average=True):
-    # 改为 float64 计算
+    
     X = X.to(torch.float64)
     Y = Y.to(torch.float64)
     if weights is None:
@@ -599,32 +553,29 @@ def ms_ssim_batch(X, Y, data_range=255.0, win_size=11, win_sigma=1.5, weights=No
         ssim_per_channel, cs = _ssim_torch(X_i, Y_i, data_range=data_range, win_size=win_size, win_sigma=win_sigma, K=K)
         if i < levels - 1:
             mcs.append(torch.clamp(cs, min=0.0))
-            # 与常见实现一致的下采样
+            
             X_i = F.avg_pool2d(X_i, kernel_size=2, stride=2)
             Y_i = F.avg_pool2d(Y_i, kernel_size=2, stride=2)
     ssim_per_channel = torch.clamp(ssim_per_channel, min=0.0)
-    mcs_and_ssim = torch.stack(mcs + [ssim_per_channel], dim=0)  # (level, B, C)
+    mcs_and_ssim = torch.stack(mcs + [ssim_per_channel], dim=0)  
     w = weights.view(-1, 1, 1)
-    ms = torch.prod(mcs_and_ssim ** w, dim=0)  # (B,C)
+    ms = torch.prod(mcs_and_ssim ** w, dim=0)  
     if size_average:
-        return ms.mean(dim=1).to(torch.float32)  # (B,)
+        return ms.mean(dim=1).to(torch.float32)  
     else:
-        return ms.to(torch.float32)  # (B,C)
+        return ms.to(torch.float32)  
 
 def SSIM_function_batch(A, B, F):
-    # ssim(A,F) + ssim(B,F)
-    A_t = preprocess_to_gray_batch(A)  # (B,1,H,W)
+    
+    A_t = preprocess_to_gray_batch(A)  
     F_t = preprocess_to_gray_batch(F)
     B_t = preprocess_to_gray_batch(B)
-    ssim_AF = ssim_batch(A_t, F_t, size_average=True)  # (B,)
+    ssim_AF = ssim_batch(A_t, F_t, size_average=True)  
     ssim_BF = ssim_batch(B_t, F_t, size_average=True)
     return ssim_AF + ssim_BF
 
 
-# ----------------------
-# main 测试脚本
-# ----------------------
-def _run_test():
+def _run_test(): # for CPU vs GPU consistency and speedup
     import time
     torch.manual_seed(2)
     np.random.seed(2)
@@ -632,16 +583,16 @@ def _run_test():
     H = 480
     W = 640
     C = 3
-    # 随机整数图像 0-255
+    
     vis = (np.random.rand(B, H, W, C) * 255).astype(np.uint8)
     ir = (np.random.rand(B, H, W, C) * 255).astype(np.uint8)
     fused = (np.random.rand(B, H, W, C) * 255).astype(np.uint8)
 
-    # 准备 GPU tensors
+    
     device = DEVICE
     print("Using device:", device)
 
-    # CPU 逐张计算（只测 batch0 的时间也按全部循环）
+    
     start = time.time()
     cpu_results = {}
     cpu_results['EN_vis'] = [EN_cpu(vis[i]) for i in range(B)]
@@ -659,7 +610,7 @@ def _run_test():
     cpu_results['SSIM'] = [SSIM_cpu(vis[i], ir[i], fused[i]) for i in range(B)]
     cpu_time = time.time() - start
 
-    # GPU batch 计算
+    
     start = time.time()
     vis_t = torch.tensor(vis, dtype=torch.float32, device=device)
     ir_t = torch.tensor(ir, dtype=torch.float32, device=device)
@@ -678,12 +629,12 @@ def _run_test():
     gpu_results['Nabf'] = Nabf_function_batch(vis_t, ir_t, fused_t).cpu().numpy()
     gpu_results['MI'] = MI_function_batch(vis_t, ir_t, fused_t).cpu().numpy()
     gpu_results['AG'] = AG_function_batch(vis_t).cpu().numpy()
-    # use new batch implementations for SSIM / MS-SSIM
+    
     gpu_results['SSIM'] = SSIM_function_batch(vis_t, ir_t, fused_t).cpu().numpy()
-    # gpu_results['MS_SSIM'] = MS_SSIM_function_batch(vis_t, ir_t, fused_t).cpu().numpy()
+    
     gpu_time = time.time() - start
 
-    # 比较 batch[0] 各指标
+    
     tol = 1e-4
     all_ok = True
     diffs = {}
