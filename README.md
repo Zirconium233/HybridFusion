@@ -57,7 +57,7 @@ EVAL_CALLBACK = None
             "dir_B": "./data/MSRS/test/ir"},
 }
 ```
-Run the code (no need for fixed seed, +- 0.02 on VIF and Qabf)
+Run the code (no need for fixed seed, +- 0.02 on VIF and Qabf(MSRS), Zero-shot performance on other tasks might be a little instability, but overall it is stable)
 ```
 python train_ycbcr.py
 ```
@@ -157,6 +157,29 @@ Epoch 2/10: 100%|█████████████████████
 [Eval] Epoch 2 - CT
 [Metrics][CT] VIF=0.7123  Qabf=0.5823  SSIM=0.9703  Reward=0.8521  PSNR=61.6643  MSE=0.0458  CC=0.7907  SCD=1.2058  Nabf=0.0036  MI=2.8066  AG=6.3607  EN=5.2605  SF=6.5936  SD=83.6986
 [Save] model -> ./checkpoints/stochastic_policy_ycbcr_/epoch_2
+
+...
+
+Epoch 10/10: 100%|█████████████████████████████████████| 42/42 [00:29<00:00,  1.44it/s, loss=0.4171, fusion=4.17, kld=0.2021]
+[Epoch 10] avg_total=0.4963  avg_fusion=4.9627  avg_kld=0.199372
+
+[Eval] Epoch 10 - MSRS
+[Metrics][MSRS] VIF=0.9998  Qabf=0.6853  SSIM=0.9430  Reward=0.9902  PSNR=64.8014  MSE=0.0345  CC=0.6045  SCD=1.5580  Nabf=0.0036  MI=3.6725  AG=3.4901  EN=6.6897  SF=5.9286  SD=41.0805
+
+[Eval] Epoch 10 - M3FD
+[Metrics][M3FD] VIF=0.8770  Qabf=0.6337  SSIM=0.8948  Reward=0.9075  PSNR=62.3858  MSE=0.0450  CC=0.4793  SCD=1.3885  Nabf=0.0039  MI=3.4698  AG=4.1106  EN=7.0846  SF=6.2391  SD=35.0839
+
+[Eval] Epoch 10 - RS
+[Metrics][RS] VIF=0.9206  Qabf=0.6452  SSIM=0.9402  Reward=0.9428  PSNR=62.5818  MSE=0.0432  CC=0.5371  SCD=1.1890  Nabf=0.0038  MI=5.2151  AG=4.6228  EN=7.4538  SF=7.1032  SD=47.6249
+
+[Eval] Epoch 10 - PET
+[Metrics][PET] VIF=0.9280  Qabf=0.7980  SSIM=1.2581  Reward=1.1277  PSNR=60.8715  MSE=0.0545  CC=0.7428  SCD=0.8773  Nabf=0.0007  MI=4.6298  AG=10.8982  EN=4.8386  SF=9.0552  SD=81.0979
+
+[Eval] Epoch 10 - SPECT
+[Metrics][SPECT] VIF=0.9653  Qabf=0.7745  SSIM=1.2470  Reward=1.1247  PSNR=66.8302  MSE=0.0156  CC=0.8433  SCD=0.6351  Nabf=0.0011  MI=4.5263  AG=5.8869  EN=4.4948  SF=8.1654  SD=55.0710
+
+[Eval] Epoch 10 - CT
+[Metrics][CT] VIF=0.6773  Qabf=0.6213  SSIM=0.9769  Reward=0.8621  PSNR=62.0713  MSE=0.0418  CC=0.7856  SCD=0.9926  Nabf=0.0066  MI=2.7626  AG=6.8729  EN=5.1146  SF=7.2223  SD=74.6831
 ```
 
 ## Compare the result with metrics in paper: 
@@ -177,6 +200,12 @@ The default loss you used
 240 groups loss grid search. 
 ![loss](figure/loss.png)
 
+
+### Third: Not train over 100 epochs
+
+For 100 to 500 epoch, the model overfit to MSRS dataset and generate a extreme weight map, the performance on other dataset is dropping. 
+
+![zero_shot](figure/zero_shot.png)
 
 ## Issues:
 
