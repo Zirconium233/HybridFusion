@@ -1,68 +1,71 @@
-## Get a sota comparable image fusion model within 5 min from download dataset to reproduce metrics in paper. 
+# HybridFusion
 
-### Without GPU? Try on Colab!
+## Achieve SOTA-comparable image fusion performance in 5 minutes - from dataset download to reproducing paper metrics
+
+### No GPU? Try on Colab!
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1AEjTBT7bv5LLM9hGepCagWKGaXKEHmJm?usp=sharing)
 
-### Environment(Windows or Ubuntu). (1 min)
-1. Clone this repo
-```
+### Environment Setup (Windows or Ubuntu) - 1 minute
+1. **Clone this repository**
+```bash
 git clone https://github.com/Zirconium233/HybridFusion.git 
 ```
 
-2. Python environment(make sure you have git and python first)
-```
-# If you not have an environment, install them first. 
-# Otherwise, just use your local environment. 
+2. **Install Python dependencies** (ensure you have Git and Python installed)
+```bash
+# If you don't have a Python environment, install these packages first. 
+# Otherwise, use your existing local environment. 
 pip install numpy torch accelerate torchvision matplotlib opencv-python
 ```
 
-### Prepare dataset.  (3 min)
-For MSRS(public): (641.22MiB download)
-```
+### Dataset Preparation - 3 minutes
+**For MSRS dataset (public)**: 641.22MB download
+```bash
 cd HybridFusion
 mkdir -p data
 cd data
 git clone https://github.com/Linfeng-Tang/MSRS.git
 cd ..
 ```
-(Optional):
-You can prepare other datasets for test. 
-### Run the code.  (from 1 to 5 min, determined by your device and system)
+**(Optional)**: You can prepare additional datasets for testing. 
+### Run the Code - 1 to 5 minutes (depends on your device and system)
 
-Edit the train_ycbcr.py, 
+**Edit `train_ycbcr.py`** with the following configuration: 
 ```python
-EPOCHS: int = 1 # change to 1 with small batch size
+EPOCHS: int = 1  # Change to 1 with small batch size
 LR: float = 1e-4
 KL_WEIGHT: float = 1e-5
 LOSS_SCALE_FACTOR: float = 0.1
-MIXED_PRECISION: str = "bf16"  # "no" | "fp16" | "bf16" For RTX 30 and above, use bf16; otherwise, switch to fp16, or "no" for fp32
+MIXED_PRECISION: str = "bf16"  # "no" | "fp16" | "bf16" - For RTX 30 and above, use bf16; otherwise, use fp16, or "no" for fp32
 PROJECT_DIR: str = "./checkpoints/stochastic_policy_ycbcr"
 SAVE_IMAGES_TO_DIR: bool = True
-TRAIN_BATCH_SIZE: int = 4 # change to 4 to avoid out of memory on 8GB device. 
+TRAIN_BATCH_SIZE: int = 4  # Change to 4 to avoid out of memory on 8GB devices
 TEST_BATCH_SIZE: int = 2
 NUM_WORKERS: int = 4
 GRAD_ACCUM_STEPS: int = 2
 MAX_GRAD_NORM: float = 1.0
 TEST_FREQ: int = 1
 SAVE_FREQ: int = 1
-METRIC_MODE: str = 'mu' # We added randomness to the method, but this randomness is a very poor implementation. Do not use 'sample'
+METRIC_MODE: str = 'mu'  # We added randomness to the method, but this randomness is poorly implemented. Do not use 'sample'
 SAVE_MODELS: bool = True
 EVAL_CALLBACK = None
 # ...existing code...
-"MSRS": { # Default path
+"MSRS": {  # Default path
   "train": {"dir_A": "./data/MSRS/train/vi", 
             "dir_B": "./data/MSRS/train/ir"},
   "test":  {"dir_A": "./data/MSRS/test/vi",
             "dir_B": "./data/MSRS/test/ir"},
 }
 ```
-Run the code (no need for fixed seed, +- 0.02 on VIF and Qabf(MSRS), Zero-shot performance on other tasks might be a little instability, but overall it is stable)
-```
+**Run the training** (no need for fixed seed; ±0.02 variation on VIF and Qabf for MSRS. Zero-shot performance on other tasks might show slight instability, but overall performance is stable):
+```bash
 python train_ycbcr.py
 ```
 
-The log on RTX 4060 Laptop (79w/140w power consumption, WSL2 Ubuntu 24.04LTS)
+### Performance Benchmarks
+
+**RTX 4060 Laptop** (79W/140W power consumption, WSL2 Ubuntu 24.04 LTS):
 ```
 [Config] epochs=1, lr=0.0001, kl_w=1e-05, loss_scale=0.1, mp=bf16
 [Dirs] project_dir=./checkpoints/stochastic_policy_ycbcr
@@ -75,8 +78,8 @@ Epoch 1/1: 100%|█████████████████████�
 [Final] model -> ./checkpoints/stochastic_policy_ycbcr/final
 ```
 
-The log on RTX 4060 Laptop (81w/140w power consumption, windows)
-**Note that we do not recommend running the code on windows because under the same conditions(GPU), it is 10 times slower than wsl2, and I don't know why.**
+**RTX 4060 Laptop** (81W/140W power consumption, Windows):
+> **Note**: We do not recommend running the code on Windows as it is 10x slower than WSL2 under the same GPU conditions, for unknown reasons.
 ```
 PS C:\Users\xxx\Desktop\code\experiment4\HybridFusion> python .\train_ycbcr.py
 C:\Users\xxx\AppData\Local\Programs\Python\Python312\Lib\site-packages\accelerate\accelerator.py:530: UserWarning: `log_with=tensorboard` was passed but no supported trackers are currently installed.
@@ -92,7 +95,7 @@ Epoch 1/1: 100%|█████████████████████�
 [Final] model -> ./checkpoints/stochastic_policy_ycbcr/final
 ```
 
-The log on Colab T4 GPU:
+**Colab T4 GPU**:
 ```
 Launching training on one GPU.
 [Config] epochs=1, lr=0.0001, kl_w=1e-05, loss_scale=0.1, mp=fp16
@@ -107,7 +110,7 @@ Epoch 1/1: 100%
 [Final] model -> /content/checkpoints/stochastic_policy_ycbcr/final
 ```
 
-The log on RTX 4090 (389w/450w power consumption, Ubuntu)
+**RTX 4090** (389W/450W power consumption, Ubuntu):
 ```
 /home/zhangran/miniconda3/envs/fusionrl/lib/python3.12/site-packages/accelerate/accelerator.py:530: UserWarning: `log_with=tensorboard` was passed but no supported trackers are currently installed.
   warnings.warn(f"`log_with={log_with}` was passed but no supported trackers are currently installed.")
@@ -182,36 +185,36 @@ Epoch 10/10: 100%|████████████████████�
 [Metrics][CT] VIF=0.6773  Qabf=0.6213  SSIM=0.9769  Reward=0.8621  PSNR=62.0713  MSE=0.0418  CC=0.7856  SCD=0.9926  Nabf=0.0066  MI=2.7626  AG=6.8729  EN=5.1146  SF=7.2223  SD=74.6831
 ```
 
-## Compare the result with metrics in paper: 
+## Results Comparison with Paper Metrics 
 
 ![IVF](figure/ivf.png)
 
-## Why it works? 
+## Why Does It Work?
 
-### Frist: the size of the model(and the goal definition for model) determines the convergence speed
+### 1. Model Size and Goal Definition Determine Convergence Speed
 
 ![abl](figure/abl.png)
 
-Feel free to enlarge the model, when you inference with a full size image, there won't be much difference in speed between the 80k model and the 17M model. 
+Feel free to increase the model size. When inferring with full-size images, there won't be much speed difference between the 80K parameter model and the 17M parameter model.
 
-### Second: Loss decides the up-bond for metrics. 
+### 2. Loss Function Determines the Upper Bound for Metrics
 
-The default loss you used 
-240 groups loss grid search. 
+The default loss configuration used:
+240 groups in loss grid search. 
 ![loss](figure/loss.png)
 
 
-### Third: Not train over 100 epochs
+### 3. Avoid Training Beyond 100 Epochs
 
-For 100 to 500 epoch, the model overfit to MSRS dataset and generate a extreme weight map, the performance on other dataset is dropping. 
+Training for 100-500 epochs causes the model to overfit to the MSRS dataset and generate extreme weight maps, resulting in decreased performance on other datasets. 
 
 ![zero_shot](figure/zero_shot.png)
 
-## Issues:
+## Frequently Asked Questions
 
-1. Q: The kld loss and sampling is for what? 
-A: At first, we intended to construct random methods that could be optimized by reinforcement learning for non-differentiable indicators such as human feed back. Then, during the pre-training, we found that hybrid methods was so powerful that achieve sota for 100 steps. By the way, this sample process is actually very poorly designed and is not recommended for use.
+**Q: What is the purpose of KLD loss and sampling?**
+A: Initially, we intended to construct randomized methods that could be optimized by reinforcement learning for non-differentiable indicators such as human feedback. However, during pre-training, we discovered that hybrid methods were so powerful that they achieved SOTA performance in just 100 steps. Note that this sampling process is actually poorly designed and is not recommended for use.
 
-2. Worry about high metrics low performance? 
-See `checkpoints/stochastic_policy_ycbcr/images` after running the code to see generated images. 
+**Q: Concerned about high metrics but low visual performance?**
+A: Check the `checkpoints/stochastic_policy_ycbcr/images` directory after running the code to view the generated images and verify visual quality and zero-shot performance. 
 
