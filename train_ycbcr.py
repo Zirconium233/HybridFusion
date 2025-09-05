@@ -17,12 +17,12 @@ from metric.MetricGPU import VIF_function_batch, Qabf_function_batch, SSIM_funct
 # -------------------------------
 # 超参数配置（与 train.py 基本一致）
 # -------------------------------
-EPOCHS: int = 500
+EPOCHS: int = 12
 LR: float = 1e-4
 KL_WEIGHT: float = 1e-5
 LOSS_SCALE_FACTOR: float = 0.1
 MIXED_PRECISION: str = "bf16"  # "no" | "fp16" | "bf16"
-PROJECT_DIR: str = "./checkpoints/stochastic_policy_ycbcr_final"
+PROJECT_DIR: str = "./checkpoints/stochastic_policy_ycbcr"
 SAVE_IMAGES_TO_DIR: bool = True
 TRAIN_BATCH_SIZE: int = 16
 TEST_BATCH_SIZE: int = 2
@@ -30,7 +30,7 @@ NUM_WORKERS: int = 4
 GRAD_ACCUM_STEPS: int = 2
 MAX_GRAD_NORM: float = 1.0
 TEST_FREQ: int = 1
-SAVE_FREQ: int = 50
+SAVE_FREQ: int = 1
 METRIC_MODE: str = 'mu' # mu or sample
 SAVE_MODELS: bool = True
 EVAL_CALLBACK = None

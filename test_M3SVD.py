@@ -29,7 +29,7 @@ BATCH_SIZE = 48
 NUM_WORKERS = 4
 PIN_MEMORY = True
 
-CKPT_ROOT = "./checkpoints/stochastic_policy_ycbcr_final"
+CKPT_ROOT = "./checkpoints/stochastic_policy_ycbcr"
 EPOCHS_TO_EVAL = [2, 10]  # 需要评测的epoch
 OUT_DIR = "./checkpoints/M3SVD_eval"
 os.makedirs(OUT_DIR, exist_ok=True)

@@ -12,12 +12,12 @@ from model.traditional_fusion import LaplacianPyramidFusion
 # 可调参数（硬编码）
 # -------------------------------
 # 模型与推理
-PROJECT_DIR = "./checkpoints/stochastic_policy_stage1_final"
-CKPT_EPOCH = 2  # 加载第 2 个 epoch 的模型
+PROJECT_DIR = "./checkpoints/stochastic_policy_ycbcr_final"
+CKPT_EPOCH = 10  # 加载第 10 个 epoch 的模型
 MIXED_PRECISION_DTYPE = torch.float32  # 可选 torch.float32/torch.float16/torch.bfloat16
 
 # 数据与保存 (generate image的速度瓶颈在PNG的CPU压缩和磁盘IO的For循环)
-OUT_ROOT = "./save_images/Inference"
+OUT_ROOT = "./save_images/Inference_image"
 DATASETS = {
     "MSRS": {
         "dir_A": "./data/MSRS-main/MSRS-main/test/vi",

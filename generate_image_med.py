@@ -16,17 +16,10 @@ from model.traditional_fusion import LaplacianPyramidFusion
 # 模型来源（多种训练条件）
 # key 为条件名；value 为每个任务的检查点目录（脚本会在该目录下尝试 final/epoch_X 形式）
 MODEL_SOURCES: Dict[str, Dict[str, str]] = {
-    # 例如 10 epoch 的实验
-    "Med_Task": {
-        "PET": "./checkpoints/Med_Task/PET",
-        "SPECT": "./checkpoints/Med_Task/SPECT",
-        "CT": "./checkpoints/Med_Task/CT",
-    },
-    # 例如 500 epoch 的实验（参考 train_med.py）
-    "Med_Task_500": {
-        "PET": "./checkpoints/Med_Task_500/PET",
-        "SPECT": "./checkpoints/Med_Task_500/SPECT",
-        "CT": "./checkpoints/Med_Task_500/CT",
+    "Med_ycbcr_500": {
+        "PET": "./checkpoints/Med_ycbcr_500/PET",
+        "SPECT": "./checkpoints/Med_ycbcr_500/SPECT",
+        "CT": "./checkpoints/Med_ycbcr_500/CT",
     },
 }
 # 模型文件优先顺序（按下列顺序寻找）
@@ -66,7 +59,7 @@ NUM_WORKERS = 4
 PIN_MEMORY = True
 
 # 保存目录
-OUT_ROOT = "./save_images/med"
+OUT_ROOT = "./save_images/med_ycbcr"
 
 torch.backends.cudnn.benchmark = False
 
