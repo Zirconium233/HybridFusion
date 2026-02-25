@@ -4,6 +4,7 @@
 
 ### No GPU? Try on Colab!
 
+[![arXiv](https://img.shields.io/badge/arXiv-2602.20851-b31b1b.svg)](https://arxiv.org/abs/2602.20851)
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1AEjTBT7bv5LLM9hGepCagWKGaXKEHmJm?usp=sharing)
 
 ### Environment Setup (Windows or Ubuntu) - 1 minute
@@ -210,7 +211,7 @@ Training for 100-500 epochs causes the model to overfit to the MSRS dataset and 
 
 ![zero_shot](figure/zero_shot.png)
 
-## Frequently Asked Questions
+## Some Questions
 
 **Q: What is the purpose of KLD loss and sampling?**
 A: Initially, we intended to construct randomized methods that could be optimized by reinforcement learning for non-differentiable indicators such as human feedback. However, during pre-training, we discovered that hybrid methods were so powerful that they achieved SOTA performance in just 100 steps. Note that this sampling process is actually poorly designed and is not recommended for use.
